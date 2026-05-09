@@ -39,18 +39,18 @@
 /* ---- TUNABLES --------------------------------------------------------- */
 
 /* Speed caps as % of 8-bit PWM full scale (0..100). */
-#define MAX_SPEED_PCT     70
-#define BASE_SPEED_PCT    25      /* forward speed when centred */
+#define MAX_SPEED_PCT     100
+#define BASE_SPEED_PCT    75      /* forward speed when centred */
 
 /* Per-motor trim, signed % of full PWM. Compensates for the fact that
- * two "identical" DC motors never spin at the same speed for the same
+ * two "identical0" DC motors never spin at the same speed for the same
  * PWM. Positive value boosts LEFT and cuts RIGHT (i.e. steers RIGHT,
  * fights drift toward the left wall). Tune in steps of 2..3. */
-#define MOTOR_TRIM_PCT     5      /* try 5 first if drifting left */
+#define MOTOR_TRIM_PCT     6      /* try 5 first if drifting left */
 
 /* PID gains stored as gain * 100 (fixed-point, no floats on AVR). */
-#define KP_X100           15      /* Kp = 0.30 */
-#define KD_X100           30      /* Kd = 0.50 */
+#define KP_X100           18      /* Kp = 0.30 */
+#define KD_X100           68      /* Kd = 0.50 */
 #define KI_X100            0      /* start with PD only */
 
 #define INTEG_LIMIT     4000      /* anti-windup clamp */
