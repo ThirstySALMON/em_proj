@@ -59,7 +59,7 @@
 
 /* Timed open-loop turn (no encoders). Calibrate against your actual bot. */
 #define TURN_ENTRY_OVFS     12     /* ~395 ms forward to clear the corner */
-#define TURN_SPIN_OVFS      20     /* ~655 ms tank spin — adjust until 90° */
+#define TURN_SPIN_OVFS      13     /* ~655 ms tank spin — adjust until 90° */
 #define TURN_SETTLE_OVFS     3     /* ~98 ms brake before re-engaging PID  */
 #define TURN_SPIN_PCT       60     /* PWM during the tank spin (0..100)   */
 
