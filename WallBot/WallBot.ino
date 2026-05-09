@@ -1,35 +1,27 @@
 /*
- * WallBot — Step 3 bring-up: TB6612FNG motor test (sensors still live).
+ * WallBot — Step 4: PID corridor centering.
  *
- * Strict register-level. No Arduino library calls (digitalWrite, delay,
- * Serial.print, etc.). The .ino is here only because the Arduino IDE
- * needs an entry point; setup() and loop() are used as plain functions.
+ * Strict register-level. No Arduino library calls.
+ *
+ *   error = right_mm - left_mm     (positive => closer to LEFT wall)
+ *   turn  = Kp*error + Kd*(error-prev) + Ki*sum
+ *   left  = base + turn            right = base - turn
+ *
+ * Tunables are at the top of this file. Speeds are expressed as 0..100 %
+ * of the 8-bit PWM full scale (255), so MAX_SPEED_PCT actually limits the
+ * current the motors can pull.
  *
  * Test procedure:
- *   1. *** Lift the robot so wheels spin free, OR remove wheels. ***
- *   2. Power motors from the battery (VM). USB alone won't drive them.
- *   3. HC-05 still unplugged from D0/D1; debug over USB-serial.
- *   4. Upload (Arduino Nano, ATmega328P / Old Bootloader if needed).
- *   5. Open Serial Monitor at 9600 baud.
- *   6. The sketch runs an automatic 7-step demo on a ~2 s cadence:
- *
- *        STEP   ACTION                EXPECTED
- *        ----   --------------------  ------------------------------
- *        0      idle (STBY low)       wheels free, no current
- *        1      forward 50 % both     both wheels turn FORWARD
- *        2      brake                 wheels stop hard
- *        3      reverse 50 % both     both wheels turn BACKWARD
- *        4      brake                 wheels stop hard
- *        5      spin LEFT (in place)  L back, R fwd  (CCW from above)
- *        6      spin RIGHT (in place) L fwd, R back  (CW  from above)
- *        7      coast                 wheels free-wheel; stays here
- *
- *      Each line printed is:
- *        [step] F=<mm> R=<mm> L=<mm>
- *
- *   7. If a wheel spins the wrong way for its step, swap that motor's
- *      two leads at the TB6612 output (AO1<->AO2 or BO1<->BO2). Do NOT
- *      change pin macros — the convention is "positive speed = forward".
+ *   1. Lift wheels OR place robot in a 45 cm corridor with both side
+ *      walls present and the front clear.
+ *   2. HC-05 still unplugged; debug over USB-serial @ 9600.
+ *   3. Watch the printed line:
+ *        L=<mm>  R=<mm>  F=<mm>  err=<mm>  outL=<pwm>  outR=<pwm>
+ *      "----" = sensor saw nothing (out of range or timeout).
+ *      Both side readings must be valid for PID to steer.
+ *   4. With Kp only, expect oscillation. Add Kd to damp. Leave Ki=0
+ *      for now — it tends to wind up on this kind of geometry.
+ *   5. Front-stop kicks in if anything is closer than FRONT_STOP_MM.
  */
 
 #include <avr/io.h>
@@ -44,67 +36,159 @@
 #define F_CPU 16000000UL
 #endif
 
-#define DEMO_SPEED      128             /* ~50 % duty */
-#define STEP_OVFS       60              /* 60 * 32.768 ms ≈ 1.97 s per step */
+/* ---- TUNABLES --------------------------------------------------------- */
 
-static void print_reading(const char *label, uint16_t mm) {
+/* Speed caps as % of 8-bit PWM full scale (0..100). */
+#define MAX_SPEED_PCT     50
+#define BASE_SPEED_PCT    35      /* forward speed when centred */
+
+/* PID gains stored as gain * 100 (fixed-point, no floats on AVR). */
+#define KP_X100           30      /* Kp = 0.30 */
+#define KD_X100           50      /* Kd = 0.50 */
+#define KI_X100            0      /* start with PD only */
+
+#define INTEG_LIMIT     4000      /* anti-windup clamp */
+
+/* Front-sensor emergency stop. Robot brakes if anything is closer. */
+#define FRONT_STOP_MM    120
+
+/* PID update cadence: every N Timer1 overflows. 1 ovf ≈ 32.768 ms. */
+#define PID_PERIOD_OVFS    1      /* ~30 Hz */
+#define PRINT_PERIOD_OVFS  8      /* ~262 ms */
+
+/* ---- DERIVED ---------------------------------------------------------- */
+
+#define PCT_TO_PWM(p)     ((int16_t)(((int32_t)(p) * 255) / 100))
+#define MAX_SPEED         PCT_TO_PWM(MAX_SPEED_PCT)
+#define BASE_SPEED        PCT_TO_PWM(BASE_SPEED_PCT)
+
+/* ---- STATE ------------------------------------------------------------ */
+
+static int16_t prev_error = 0;
+static int32_t integ      = 0;
+static int16_t last_outL  = 0;
+static int16_t last_outR  = 0;
+static int16_t last_error = 0;
+static uint8_t front_braking = 0;
+
+/* ---- HELPERS ---------------------------------------------------------- */
+
+static inline int16_t clamp16(int32_t v, int16_t lim) {
+    if (v >  lim) return  lim;
+    if (v < -lim) return -lim;
+    return (int16_t)v;
+}
+
+static void print_field(const char *label, int16_t v, uint8_t is_signed) {
+    uart_puts(label);
+    if (is_signed) uart_put_i16(v);
+    else           uart_put_u16((uint16_t)v);
+    uart_putc(' ');
+}
+
+static void print_dist(const char *label, uint16_t mm) {
     uart_puts(label);
     if (mm == US_NO_READING) uart_puts("----");
     else                     uart_put_u16(mm);
     uart_putc(' ');
 }
 
-static void apply_step(uint8_t step) {
-    switch (step) {
-        case 0: motors_enable(0); motors_coast();                   break;
-        case 1: motors_enable(1); motors_set( DEMO_SPEED,  DEMO_SPEED); break;
-        case 2: motors_enable(1); motors_stop();                    break;
-        case 3: motors_enable(1); motors_set(-DEMO_SPEED, -DEMO_SPEED); break;
-        case 4: motors_enable(1); motors_stop();                    break;
-        case 5: motors_enable(1); motors_set(-DEMO_SPEED,  DEMO_SPEED); break;
-        case 6: motors_enable(1); motors_set( DEMO_SPEED, -DEMO_SPEED); break;
-        default:motors_enable(0); motors_coast();                   break; /* 7+ */
+/* ---- PID -------------------------------------------------------------- */
+
+static void pid_step(void) {
+    uint16_t L = us_distance_mm(US_LEFT);
+    uint16_t R = us_distance_mm(US_RIGHT);
+    uint16_t F = us_distance_mm(US_FRONT);
+
+    /* 1) Front-sensor safety: hard brake on obstacle. */
+    if (F != US_NO_READING && F < FRONT_STOP_MM) {
+        motors_stop();
+        last_outL = last_outR = 0;
+        front_braking = 1;
+        return;
     }
+    front_braking = 0;
+
+    /* 2) Need both side walls to do PID. If either is missing, crawl
+     *    forward in a straight line at half base speed and hold the
+     *    integrator (don't accumulate error against unknown geometry). */
+    if (L == US_NO_READING || R == US_NO_READING) {
+        int16_t crawl = BASE_SPEED / 2;
+        motors_set(crawl, crawl);
+        last_outL = last_outR = crawl;
+        last_error = 0;
+        return;
+    }
+
+    /* 3) PID on lateral error. */
+    int16_t error = (int16_t)R - (int16_t)L;
+    int16_t deriv = error - prev_error;
+    integ += error;
+    if (integ >  INTEG_LIMIT) integ =  INTEG_LIMIT;
+    if (integ < -INTEG_LIMIT) integ = -INTEG_LIMIT;
+
+    int32_t turn = ((int32_t)KP_X100 * error
+                  + (int32_t)KD_X100 * deriv
+                  + (int32_t)KI_X100 * integ) / 100;
+
+    /* Cap differential so we never reverse a wheel just from PID. */
+    int16_t turn_pwm = clamp16(turn, BASE_SPEED);
+
+    int16_t left  = clamp16((int32_t)BASE_SPEED + turn_pwm, MAX_SPEED);
+    int16_t right = clamp16((int32_t)BASE_SPEED - turn_pwm, MAX_SPEED);
+
+    motors_set(left, right);
+
+    prev_error = error;
+    last_outL  = left;
+    last_outR  = right;
+    last_error = error;
 }
 
+/* ---- ENTRY POINTS ----------------------------------------------------- */
+
 void setup(void) {
-    LED_DDR |= (1 << LED_BIT);
+    LED_DDR  |=  (1 << LED_BIT);
     LED_PORT &= ~(1 << LED_BIT);
 
     uart_init(9600);
     us_init();
-    motors_init();                  /* STBY held LOW until step 1 */
+    motors_init();
     sei();
 
-    uart_puts("\r\nWallBot bring-up: motor demo (step 0..7)\r\n");
-    apply_step(0);
+    uart_puts("\r\nWallBot: PID corridor centering\r\n");
+    uart_puts("MAX="); uart_put_u16(MAX_SPEED_PCT);
+    uart_puts("%  BASE="); uart_put_u16(BASE_SPEED_PCT);
+    uart_puts("%  Kp*100="); uart_put_u16(KP_X100);
+    uart_puts(" Kd*100=");   uart_put_u16(KD_X100);
+    uart_puts(" Ki*100=");   uart_put_u16(KI_X100);
+    uart_puts("\r\n");
+
+    motors_enable(1);
 }
 
 void loop(void) {
     static uint16_t last_print_ovf = 0;
-    static uint16_t step_start_ovf = 0;
-    static uint8_t  step = 0;
+    static uint16_t last_pid_ovf   = 0;
 
     us_service();
 
     uint16_t ovf = us_overflow_count();
 
-    /* Advance demo step every ~2 s, then latch on the final step. */
-    if (step <= 6 && (uint16_t)(ovf - step_start_ovf) >= STEP_OVFS) {
-        step_start_ovf = ovf;
-        step++;
-        apply_step(step);
+    if ((uint16_t)(ovf - last_pid_ovf) >= PID_PERIOD_OVFS) {
+        last_pid_ovf = ovf;
+        pid_step();
     }
 
-    /* Print sensor + step state every ~262 ms. */
-    if ((uint16_t)(ovf - last_print_ovf) >= 8) {
+    if ((uint16_t)(ovf - last_print_ovf) >= PRINT_PERIOD_OVFS) {
         last_print_ovf = ovf;
-        uart_putc('[');
-        uart_put_u16(step);
-        uart_puts("] ");
-        print_reading("F=", us_distance_mm(US_FRONT));
-        print_reading("R=", us_distance_mm(US_RIGHT));
-        print_reading("L=", us_distance_mm(US_LEFT));
+        print_dist ("L=",    us_distance_mm(US_LEFT));
+        print_dist ("R=",    us_distance_mm(US_RIGHT));
+        print_dist ("F=",    us_distance_mm(US_FRONT));
+        print_field("err=",  last_error, 1);
+        print_field("oL=",   last_outL,  1);
+        print_field("oR=",   last_outR,  1);
+        if (front_braking) uart_puts("[STOP]");
         uart_puts("\r\n");
         LED_PORT ^= (1 << LED_BIT);
     }
