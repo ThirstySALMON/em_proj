@@ -40,7 +40,7 @@
 
 /* Speed caps as % of 8-bit PWM full scale (0..100). */
 #define MAX_SPEED_PCT     70
-#define BASE_SPEED_PCT    50      /* forward speed when centred */
+#define BASE_SPEED_PCT    25      /* forward speed when centred */
 
 /* Per-motor trim, signed % of full PWM. Compensates for the fact that
  * two "identical" DC motors never spin at the same speed for the same
@@ -49,8 +49,8 @@
 #define MOTOR_TRIM_PCT     5      /* try 5 first if drifting left */
 
 /* PID gains stored as gain * 100 (fixed-point, no floats on AVR). */
-#define KP_X100           30      /* Kp = 0.30 */
-#define KD_X100           50      /* Kd = 0.50 */
+#define KP_X100           15      /* Kp = 0.30 */
+#define KD_X100           30      /* Kd = 0.50 */
 #define KI_X100            0      /* start with PD only */
 
 #define INTEG_LIMIT     4000      /* anti-windup clamp */
@@ -137,7 +137,7 @@ static void pid_step(void) {
                   + (int32_t)KD_X100 * deriv
                   + (int32_t)KI_X100 * integ) / 100;
 
-    /* Cap differential so we never reverse a wheel just from PID. */
+    /* Cap differential so PID alone can't reverse a wheel. */
     int16_t turn_pwm = clamp16(turn, BASE_SPEED);
 
     int16_t left  = (int16_t)((int32_t)BASE_SPEED + turn_pwm);
@@ -146,8 +146,15 @@ static void pid_step(void) {
     /* Static motor trim — applied AFTER PID so the controller and the
      * imbalance are decoupled. Positive trim => left faster, right slower. */
     int16_t trim_pwm = PCT_TO_PWM(MOTOR_TRIM_PCT);
-    left  = clamp16((int32_t)left  + trim_pwm, MAX_SPEED);
-    right = clamp16((int32_t)right - trim_pwm, MAX_SPEED);
+    left  += trim_pwm;
+    right -= trim_pwm;
+
+    /* Floor each wheel at 0 — no spinning in place during centering.
+     * If you want true 90° turns, that goes in Step 5 (turn execute). */
+    if (left  < 0) left  = 0;
+    if (right < 0) right = 0;
+    if (left  > MAX_SPEED) left  = MAX_SPEED;
+    if (right > MAX_SPEED) right = MAX_SPEED;
 
     motors_set(left, right);
 
