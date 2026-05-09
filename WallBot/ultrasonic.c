@@ -14,6 +14,15 @@
 #define US_TICKS_PER_OVF      0xFFFFu
 #define US_ECHO_TIMEOUT_TICKS 50000u   /* ~25 ms ≈ 4.3 m round-trip */
 
+/* Asymmetric spike-rejection filter:
+ *   - Downward jumps (object got CLOSER) accept immediately. Safety wins.
+ *   - Upward jumps larger than US_SPIKE_MM, and US_NO_READING timeouts,
+ *     require US_SPIKE_TOLERANCE consecutive bad samples before they're
+ *     committed. Single-frame echo glitches are silently dropped.
+ *   - The first sample after init / after a timeout is always accepted. */
+#define US_SPIKE_MM           150u
+#define US_SPIKE_TOLERANCE      2u
+
 /* HC-SR04 datasheet: distance_cm = pulse_us / 58.
  * With 0.5 us/tick: distance_mm = ticks * 5 / 58. Use uint32 multiply
  * to avoid 16-bit overflow (max ~25000 ticks * 5 = 125000 fits in u32). */
@@ -26,6 +35,7 @@ static volatile uint16_t echo_start[US_COUNT];
 static volatile uint16_t distance_mm[US_COUNT];
 static volatile uint8_t  pending[US_COUNT];     /* 1 if waiting for falling edge */
 static volatile uint16_t pending_start_t1[US_COUNT]; /* TCNT1 at trigger time */
+static volatile uint8_t  suspicion[US_COUNT];   /* spike-filter run length */
 
 /* Round-robin scheduler driven by Timer1 overflow. */
 static volatile uint8_t  next_sensor;
@@ -48,6 +58,42 @@ static inline void trig_pulse_left(void) {
     TRIG_LEFT_PORT  |=  (1 << TRIG_LEFT_BIT);
     _delay_us(10);
     TRIG_LEFT_PORT  &= ~(1 << TRIG_LEFT_BIT);
+}
+
+/* Asymmetric spike filter. Called from PCINT (falling edge) with new
+ * distance, and from us_service (timeout) with US_NO_READING. Caller
+ * must guarantee atomicity vs. ISRs (PCINT context is already atomic;
+ * us_service wraps the call in ATOMIC_BLOCK). */
+static void commit_reading(uint8_t i, uint16_t new_d) {
+    uint16_t last = distance_mm[i];
+
+    /* No prior valid sample — accept immediately so the first reading
+     * is always available. */
+    if (last == US_NO_READING) {
+        distance_mm[i] = new_d;
+        suspicion[i] = 0;
+        return;
+    }
+
+    /* Timeout. Need confirmation before declaring "wall vanished". */
+    if (new_d == US_NO_READING) {
+        if (++suspicion[i] >= US_SPIKE_TOLERANCE) {
+            distance_mm[i] = US_NO_READING;
+            suspicion[i] = 0;
+        }
+        return;
+    }
+
+    /* Numeric reading. Closer or only slightly farther → accept now.
+     * Big upward jump → wait for confirmation (one more sample). */
+    if (new_d <= last || (uint16_t)(new_d - last) <= US_SPIKE_MM) {
+        distance_mm[i] = new_d;
+        suspicion[i] = 0;
+    } else if (++suspicion[i] >= US_SPIKE_TOLERANCE) {
+        distance_mm[i] = new_d;
+        suspicion[i] = 0;
+    }
+    /* else: keep last value, drop this sample */
 }
 
 static void fire_sensor(uint8_t s) {
@@ -91,7 +137,8 @@ void us_init(void) {
 
     for (uint8_t i = 0; i < US_COUNT; i++) {
         distance_mm[i] = US_NO_READING;
-        pending[i] = 0;
+        pending[i]     = 0;
+        suspicion[i]   = 0;
     }
     next_sensor = 0;
     ovf_tick    = 0;
@@ -109,11 +156,13 @@ void us_service(void) {
      * sensor or an out-of-range target doesn't strand pending[]. */
     uint16_t now = TCNT1;
     for (uint8_t i = 0; i < US_COUNT; i++) {
-        if (pending[i]) {
-            uint16_t elapsed = now - pending_start_t1[i];   /* wraps OK */
-            if (elapsed > US_ECHO_TIMEOUT_TICKS) {
-                pending[i] = 0;
-                distance_mm[i] = US_NO_READING;
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            if (pending[i]) {
+                uint16_t elapsed = now - pending_start_t1[i];   /* wraps OK */
+                if (elapsed > US_ECHO_TIMEOUT_TICKS) {
+                    pending[i] = 0;
+                    commit_reading(i, US_NO_READING);
+                }
             }
         }
     }
@@ -149,7 +198,7 @@ ISR(PCINT0_vect) {                  /* PORTB — right echo on PB1 */
     if (ECHO_RIGHT_PIN & (1 << ECHO_RIGHT_BIT)) {
         echo_start[US_RIGHT] = t;
     } else if (pending[US_RIGHT]) {
-        distance_mm[US_RIGHT] = ticks_to_mm((uint16_t)(t - echo_start[US_RIGHT]));
+        commit_reading(US_RIGHT, ticks_to_mm((uint16_t)(t - echo_start[US_RIGHT])));
         pending[US_RIGHT] = 0;
     }
 }
@@ -159,7 +208,7 @@ ISR(PCINT1_vect) {                  /* PORTC — left echo on PC3 */
     if (ECHO_LEFT_PIN & (1 << ECHO_LEFT_BIT)) {
         echo_start[US_LEFT] = t;
     } else if (pending[US_LEFT]) {
-        distance_mm[US_LEFT] = ticks_to_mm((uint16_t)(t - echo_start[US_LEFT]));
+        commit_reading(US_LEFT, ticks_to_mm((uint16_t)(t - echo_start[US_LEFT])));
         pending[US_LEFT] = 0;
     }
 }
@@ -169,7 +218,7 @@ ISR(PCINT2_vect) {                  /* PORTD — front echo on PD6 */
     if (ECHO_FRONT_PIN & (1 << ECHO_FRONT_BIT)) {
         echo_start[US_FRONT] = t;
     } else if (pending[US_FRONT]) {
-        distance_mm[US_FRONT] = ticks_to_mm((uint16_t)(t - echo_start[US_FRONT]));
+        commit_reading(US_FRONT, ticks_to_mm((uint16_t)(t - echo_start[US_FRONT])));
         pending[US_FRONT] = 0;
     }
 }
