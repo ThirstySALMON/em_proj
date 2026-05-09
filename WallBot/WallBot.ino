@@ -39,8 +39,8 @@
 /* ---- TUNABLES --------------------------------------------------------- */
 
 /* Speed caps as % of 8-bit PWM full scale (0..100). */
-#define MAX_SPEED_PCT     50
-#define BASE_SPEED_PCT    35      /* forward speed when centred */
+#define MAX_SPEED_PCT     70
+#define BASE_SPEED_PCT    50      /* forward speed when centred */
 
 /* PID gains stored as gain * 100 (fixed-point, no floats on AVR). */
 #define KP_X100           30      /* Kp = 0.30 */
