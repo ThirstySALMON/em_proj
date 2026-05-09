@@ -42,6 +42,12 @@
 #define MAX_SPEED_PCT     70
 #define BASE_SPEED_PCT    50      /* forward speed when centred */
 
+/* Per-motor trim, signed % of full PWM. Compensates for the fact that
+ * two "identical" DC motors never spin at the same speed for the same
+ * PWM. Positive value boosts LEFT and cuts RIGHT (i.e. steers RIGHT,
+ * fights drift toward the left wall). Tune in steps of 2..3. */
+#define MOTOR_TRIM_PCT     5      /* try 5 first if drifting left */
+
 /* PID gains stored as gain * 100 (fixed-point, no floats on AVR). */
 #define KP_X100           30      /* Kp = 0.30 */
 #define KD_X100           50      /* Kd = 0.50 */
@@ -134,8 +140,14 @@ static void pid_step(void) {
     /* Cap differential so we never reverse a wheel just from PID. */
     int16_t turn_pwm = clamp16(turn, BASE_SPEED);
 
-    int16_t left  = clamp16((int32_t)BASE_SPEED + turn_pwm, MAX_SPEED);
-    int16_t right = clamp16((int32_t)BASE_SPEED - turn_pwm, MAX_SPEED);
+    int16_t left  = (int16_t)((int32_t)BASE_SPEED + turn_pwm);
+    int16_t right = (int16_t)((int32_t)BASE_SPEED - turn_pwm);
+
+    /* Static motor trim — applied AFTER PID so the controller and the
+     * imbalance are decoupled. Positive trim => left faster, right slower. */
+    int16_t trim_pwm = PCT_TO_PWM(MOTOR_TRIM_PCT);
+    left  = clamp16((int32_t)left  + trim_pwm, MAX_SPEED);
+    right = clamp16((int32_t)right - trim_pwm, MAX_SPEED);
 
     motors_set(left, right);
 
@@ -159,6 +171,7 @@ void setup(void) {
     uart_puts("\r\nWallBot: PID corridor centering\r\n");
     uart_puts("MAX="); uart_put_u16(MAX_SPEED_PCT);
     uart_puts("%  BASE="); uart_put_u16(BASE_SPEED_PCT);
+    uart_puts("%  TRIM="); uart_put_i16(MOTOR_TRIM_PCT);
     uart_puts("%  Kp*100="); uart_put_u16(KP_X100);
     uart_puts(" Kd*100=");   uart_put_u16(KD_X100);
     uart_puts(" Ki*100=");   uart_put_u16(KI_X100);
