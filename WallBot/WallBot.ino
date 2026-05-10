@@ -49,6 +49,22 @@
 
 #define FRONT_STOP_MM     70      /* hard brake threshold (FOLLOW only) */
 
+/* ---- TUNABLES: correction open-side handling -------------------------- */
+
+/* A side farther than this is still usable for turn detection, but no
+ * longer trusted for centering. Keep this below SIDE_OPEN_MM so correction
+ * ignores an opening before the turn detector fully commits. */
+#define CORR_SIDE_VALID_MAX_MM 360
+
+/* One-wall correction is intentionally gentler than the normal two-wall PID.
+ * Positive correction means left motor faster / right motor slower. */
+#define CORR_ONE_WALL_SETPOINT_MM 450
+#define CORR_ONE_WALL_KP_X100     1
+#define CORR_ONE_WALL_MAX_PCT     1
+
+/* Used when neither side looks like a reliable corridor wall. */
+#define CORR_BOTH_OPEN_SPEED_PCT  45
+
 /* ---- TUNABLES: turn detection ----------------------------------------- */
 
 /* Opening predicate requires BOTH conditions, sustained OPENING_CONFIRM
@@ -69,8 +85,8 @@
 
 /* Open-loop tank spin. Calibrate TURN_SPIN_OVFS empirically:
  *   45 ovfs ~= 1.47 s, 60 ovfs ~= 1.97 s — within the 1-2 s spec. */
-#define TURN_SPIN_PCT        35    /* PWM during spin (0..100)             */
-#define TURN_SPIN_OVFS       23    /* ~1.47 s — TUNE until 90° lands flat  */
+#define TURN_SPIN_PCT        40    /* PWM during spin (0..100)             */
+#define TURN_SPIN_OVFS       33    /* ~1.47 s — TUNE until 90° lands flat  */
 #define TURN_SETTLE_OVFS      4    /* ~131 ms brake before PID resumes     */
 
 /* Forward speed during APPROACH. Slightly slower than BASE so we don't
@@ -95,6 +111,8 @@
 #define PCT_TO_PWM(p)     ((int16_t)(((int32_t)(p) * 255) / 100))
 #define MAX_SPEED         PCT_TO_PWM(MAX_SPEED_PCT)
 #define BASE_SPEED        PCT_TO_PWM(BASE_SPEED_PCT)
+#define CORR_ONE_WALL_MAX PCT_TO_PWM(CORR_ONE_WALL_MAX_PCT)
+#define CORR_BOTH_OPEN_SPEED PCT_TO_PWM(CORR_BOTH_OPEN_SPEED_PCT)
 #define APPROACH_SPEED    PCT_TO_PWM(APPROACH_SPEED_PCT)
 #define TURN_SPIN_PWM     PCT_TO_PWM(TURN_SPIN_PCT)
 
@@ -218,30 +236,50 @@ static void correction_step(uint16_t ovf) {
     }
     front_braking = 0;
 
-    /* If a side is missing but no opening has confirmed, crawl forward.
-     * Avoids latching a noisy NO_READING into an unwanted PID swing. */
-    if (L == US_NO_READING || R == US_NO_READING) {
-        int16_t crawl = BASE_SPEED / 2;
-        motors_set(crawl, crawl);
-        last_outL = last_outR = crawl;
-        last_error = 0;
-        return;
+    uint8_t L_valid = (L != US_NO_READING && L <= CORR_SIDE_VALID_MAX_MM);
+    uint8_t R_valid = (R != US_NO_READING && R <= CORR_SIDE_VALID_MAX_MM);
+
+    int16_t drive_pwm = BASE_SPEED;
+    int16_t turn_pwm = 0;
+    int16_t error = 0;
+
+    if (L_valid && R_valid) {
+        /* Normal corridor: PID on lateral error. */
+        error = (int16_t)R - (int16_t)L;
+        int16_t deriv = error - prev_error;
+        integ += error;
+        if (integ >  INTEG_LIMIT) integ =  INTEG_LIMIT;
+        if (integ < -INTEG_LIMIT) integ = -INTEG_LIMIT;
+
+        int32_t turn = ((int32_t)KP_X100 * error
+                      + (int32_t)KD_X100 * deriv
+                      + (int32_t)KI_X100 * integ) / 100;
+
+        turn_pwm = clamp16(turn, BASE_SPEED);
+        prev_error = error;
+    } else if (L_valid) {
+        /* Only left wall is trustworthy. Too close left -> steer right. */
+        error = (int16_t)CORR_ONE_WALL_SETPOINT_MM - (int16_t)L;
+        turn_pwm = clamp16(((int32_t)CORR_ONE_WALL_KP_X100 * error) / 100,
+                           CORR_ONE_WALL_MAX);
+        prev_error = 0;
+        integ = 0;
+    } else if (R_valid) {
+        /* Only right wall is trustworthy. Too close right -> steer left. */
+        error = (int16_t)R - (int16_t)CORR_ONE_WALL_SETPOINT_MM;
+        turn_pwm = clamp16(((int32_t)CORR_ONE_WALL_KP_X100 * error) / 100,
+                           CORR_ONE_WALL_MAX);
+        prev_error = 0;
+        integ = 0;
+    } else {
+        /* Open / unreliable on both sides: drive straight and wait for walls. */
+        drive_pwm = CORR_BOTH_OPEN_SPEED;
+        prev_error = 0;
+        integ = 0;
     }
 
-    /* PID on lateral error. */
-    int16_t error = (int16_t)R - (int16_t)L;
-    int16_t deriv = error - prev_error;
-    integ += error;
-    if (integ >  INTEG_LIMIT) integ =  INTEG_LIMIT;
-    if (integ < -INTEG_LIMIT) integ = -INTEG_LIMIT;
-
-    int32_t turn = ((int32_t)KP_X100 * error
-                  + (int32_t)KD_X100 * deriv
-                  + (int32_t)KI_X100 * integ) / 100;
-
-    int16_t turn_pwm = clamp16(turn, BASE_SPEED);
-    int16_t left  = (int16_t)((int32_t)BASE_SPEED + turn_pwm);
-    int16_t right = (int16_t)((int32_t)BASE_SPEED - turn_pwm);
+    int16_t left  = (int16_t)((int32_t)drive_pwm + turn_pwm);
+    int16_t right = (int16_t)((int32_t)drive_pwm - turn_pwm);
 
     int16_t trim_pwm = PCT_TO_PWM(MOTOR_TRIM_PCT);
     left  += trim_pwm;
@@ -254,7 +292,6 @@ static void correction_step(uint16_t ovf) {
 
     motors_set(left, right);
 
-    prev_error = error;
     last_outL  = left;
     last_outR  = right;
     last_error = error;
