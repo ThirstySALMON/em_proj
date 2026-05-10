@@ -70,7 +70,7 @@
 /* Commit to spin when the front wall is this close. */
 #define F_TURN_MM           120
 
-/* Safety net: if F never crosses F_TURN_MM (e.g. front sensor failure),
+/* Safety net: if F never crosses F_TURN_MM (e.g. front sensor failure),ss
  * spin anyway after this long in PRE_TURN. ~2.0 s @ 32.768 ms/ovf. */
 #define PRE_TURN_TIMEOUT_OVFS  60
 
