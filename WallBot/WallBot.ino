@@ -34,7 +34,7 @@
 #define MOTOR_TRIM_PCT      6
 
 #define KP_X100            18
-#define KD_X100            68
+#define KD_X100            30
 #define KI_X100             0
 #define INTEG_LIMIT      4000
 
@@ -52,9 +52,9 @@
 
 #define APPROACH_TIMEOUT_OVFS  60
 
-#define TURN_SPIN_PCT       35
-#define TURN_SPIN_OVFS      23
-#define TURN_SETTLE_OVFS     4
+#define TURN_SPIN_PCT       43
+#define TURN_SPIN_OVFS      28
+#define TURN_SETTLE_OVFS    10
 
 #define APPROACH_SPEED_PCT  50
 
@@ -63,7 +63,7 @@
 
 /* ---- POST TURN ALIGN ----------------------------------------------- */
 
-#define POST_ALIGN_OVFS        8
+#define POST_ALIGN_OVFS        4
 #define POST_ALIGN_SPEED_PCT  40
 #define POST_ALIGN_KP_X100    10
 #define POST_ALIGN_MAX_TURN   25
