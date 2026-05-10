@@ -47,31 +47,30 @@
 #define KI_X100             0
 #define INTEG_LIMIT      4000
 
-#define FRONT_STOP_MM     120      /* hard brake threshold (FOLLOW only) */
+#define FRONT_STOP_MM     70      /* hard brake threshold (FOLLOW only) */
 
 /* ---- TUNABLES: turn detection ----------------------------------------- */
 
 /* Opening predicate requires BOTH conditions, sustained OPENING_CONFIRM
  * cycles. 1 overflow ~= 32.768 ms, so 3 cycles ~= 98 ms of debounce. */
-#define F_DETECT_MAX_MM     500    /* larger = start APPROACH earlier      */
-#define SIDE_OPEN_MM        430    /* lower = recognize side opening sooner */
+#define F_DETECT_MAX_MM     350    /* front must be <= this (corner ahead) */
+#define SIDE_OPEN_MM        400    /* a side counts as open at >= this     */
 #define OPENING_CONFIRM       3    /* consecutive cycles before latching   */
 
 /* ---- TUNABLES: turn execution ----------------------------------------- */
 
 /* Commit to spin when the front wall is this close. Replaces the old
  * blind TURN_ENTRY_OVFS forward burst. */
-#define F_TURN_MM           230    /* larger = start SPIN earlier          */
+#define F_TURN_MM           150
 
 /* Safety net: if F never crosses F_TURN_MM (e.g. front sensor failure),
  * spin anyway after this long in APPROACH. ~2.0 s @ 32.768 ms/ovf. */
 #define APPROACH_TIMEOUT_OVFS  60
 
 /* Open-loop tank spin. Calibrate TURN_SPIN_OVFS empirically:
- *   23 ovfs ~= 0.75 s, 45 ovfs ~= 1.47 s. If 45 gave ~180 deg,
- *   23 is the first-pass estimate for ~90 deg. */
-#define TURN_SPIN_PCT        60    /* PWM during spin (0..100)             */
-#define TURN_SPIN_OVFS       23    /* ~0.75 s — TUNE until 90° lands flat  */
+ *   45 ovfs ~= 1.47 s, 60 ovfs ~= 1.97 s — within the 1-2 s spec. */
+#define TURN_SPIN_PCT        35    /* PWM during spin (0..100)             */
+#define TURN_SPIN_OVFS       23    /* ~1.47 s — TUNE until 90° lands flat  */
 #define TURN_SETTLE_OVFS      4    /* ~131 ms brake before PID resumes     */
 
 /* Forward speed during APPROACH. Slightly slower than BASE so we don't
