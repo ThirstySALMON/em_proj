@@ -61,9 +61,9 @@
 
 /* Opening predicate requires BOTH conditions, sustained OPENING_CONFIRM
  * cycles. 1 overflow ~= 32.768 ms, so 3 cycles ~= 98 ms of debounce. */
-#define F_DETECT_MAX_MM     350    /* front must be <= this (corner ahead) */
-#define SIDE_OPEN_MM        450    /* a side counts as open at >= this     */
-#define OPENING_CONFIRM       3    /* consecutive cycles before latching   */
+#define F_DETECT_MAX_MM     475    /* front must be <= this (corner ahead) */
+#define SIDE_OPEN_MM        350    /* a side counts as open at >= this     */
+#define OPENING_CONFIRM       2    /* consecutive cycles before latching   */
 
 /* ---- TUNABLES: turn execution ----------------------------------------- */
 
@@ -400,7 +400,7 @@ static void post_turn_step(uint16_t ovf) {
 
     uint16_t L = us_distance_mm(US_LEFT);
     uint16_t R = us_distance_mm(US_RIGHT);
-    uint16_t F = us_distance_mm(US_FRONT);
+    /* uint16_t F = us_distance_mm(US_FRONT); */  /* only used by Exit (b), disabled for test */
 
     /* Exit (a): both side walls in corridor range — normal corridor
      * regained, hand off to CORRECTION's PID. */
@@ -411,14 +411,17 @@ static void post_turn_step(uint16_t ovf) {
         return;
     }
 
-    /* Exit (b): another corner ahead. Hand off to CORRECTION; its
+    /* --- DISABLED FOR TEST ---
+     * Exit (b): another corner ahead. Hand off to CORRECTION; its
      * opening-detection will pick up the next L/R immediately because
-     * F <= F_TURN_MM <= F_DETECT_MAX_MM and one side is still wide. */
-    if (F != US_NO_READING && F <= F_TURN_MM) {
-        reset_pid();
-        enter_state(ST_CORRECTION, ovf);
-        return;
-    }
+     * F <= F_TURN_MM <= F_DETECT_MAX_MM and one side is still wide.
+     *
+     * if (F != US_NO_READING && F <= F_TURN_MM) {
+     *     reset_pid();
+     *     enter_state(ST_CORRECTION, ovf);
+     *     return;
+     * }
+     */
 
     /* Safety timeout — don't get stuck wall-hugging forever. */
     if ((uint16_t)(ovf - state_start_ovf) >= POST_TURN_TIMEOUT_OVFS) {
