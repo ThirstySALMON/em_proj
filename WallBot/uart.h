@@ -12,11 +12,12 @@
 extern "C" {
 #endif
 
-void uart_init(uint32_t baud);
-void uart_putc(char c);
-void uart_puts(const char *s);
-void uart_put_u16(uint16_t v);     /* unsigned decimal */
-void uart_put_i16(int16_t v);      /* signed decimal */
+void UART_init(unsigned long baud);
+void UART_sendChar(char c);
+void UART_sendString(const char* str);
+void UART_sendInt(int n);
+uint8_t UART_receiveChar(char* data);
+uint8_t UART_receiveString(char* buf, uint8_t maxLen);
 
 #ifdef __cplusplus
 }
