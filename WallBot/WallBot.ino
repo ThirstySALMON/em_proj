@@ -1,24 +1,27 @@
 /*
- * WallBot — Step 5: PID centering + 90° turn detection & execute.
+ * WallBot — PID centering + sensor-gated 90° turn execution.
  *
  * Strict register-level. No Arduino library calls.
  *
  * FSM:
- *   FOLLOW       PID-center between L and R walls. Watch for an opening
- *                (side distance > OPENING_MM, sustained for N cycles).
- *                On confirm, latch turn direction and -> TURN_ENTRY.
- *   TURN_ENTRY   Drive forward at base speed for TURN_ENTRY_OVFS so the
- *                rotation pivot ends up *inside* the new corridor instead
- *                of clipping the old corner.
- *   TURN_SPIN    Tank-spin in latched direction at TURN_SPIN_PCT for
- *                TURN_SPIN_OVFS. Pure open-loop (no encoders) — calibrate
- *                TURN_SPIN_OVFS empirically until 90° lands flat.
- *   TURN_SETTLE  Brake briefly so wheels stop before PID re-engages.
- *                Reset PID state, record turn, -> FOLLOW.
+ *   CORRECTION   PID-center between L and R walls. Opening predicate:
+ *                front close (F <= F_DETECT_MAX_MM) AND one side wide
+ *                (side >= SIDE_OPEN_MM), sustained for OPENING_CONFIRM
+ *                cycles. On confirm, latch direction -> APPROACH.
+ *   APPROACH    Direction is locked. Keep moving forward until the
+ *                front wall closes to F_TURN_MM. PID is one-sided
+ *                (only the wall that is NOT opening). No new opening
+ *                checks, no front emergency stop. APPROACH_TIMEOUT_OVFS
+ *                is a safety bound.
+ *   SPIN         Tank-rotate in latched direction at TURN_SPIN_PCT for
+ *                TURN_SPIN_OVFS. Pure open-loop, no sensor reads, no
+ *                early exits. Calibrate TURN_SPIN_OVFS until ~90°.
+ *   SETTLE       Brake briefly. Reset PID state. Record turn.
+ *                -> CORRECTION.
  *
  * Output (every PRINT_PERIOD_OVFS):
  *   [STA] L=<mm> R=<mm> F=<mm> err=<mm> oL=<pwm> oR=<pwm> T=<count> seq=<L,R,...>
- *   STA ∈ { FOL, ENT, SPN, SET }.
+ *   STA in { COR, APP, SPN, SET }.
  */
 
 #include <avr/io.h>
@@ -46,25 +49,42 @@
 
 #define FRONT_STOP_MM     120      /* hard brake threshold (FOLLOW only) */
 
-/* ---- TUNABLES: turn detection & execute -------------------------------- */
+/* ---- TUNABLES: turn detection ----------------------------------------- */
 
-/* A side reading is "open" if it exceeds this OR returns US_NO_READING.
- * Corridor half-width is ~225 mm, so 300 mm is comfortably past the
- * other wall — almost certainly a real opening, not noise. */
-#define OPENING_MM           300
+/* Opening predicate requires BOTH conditions, sustained OPENING_CONFIRM
+ * cycles. 1 overflow ~= 32.768 ms, so 3 cycles ~= 98 ms of debounce. */
+#define F_DETECT_MAX_MM     500    /* larger = start APPROACH earlier      */
+#define SIDE_OPEN_MM        430    /* lower = recognize side opening sooner */
+#define OPENING_CONFIRM       3    /* consecutive cycles before latching   */
 
-/* Hold the open condition for this many FOLLOW cycles before triggering.
- * Filters single-frame sensor spikes that would otherwise false-positive. */
-#define OPENING_CONFIRM      3
+/* ---- TUNABLES: turn execution ----------------------------------------- */
 
-/* Timed open-loop turn (no encoders). Calibrate against your actual bot. */
-#define TURN_ENTRY_OVFS     12     /* ~395 ms forward to clear the corner */
-#define TURN_SPIN_OVFS      13     /* ~655 ms tank spin — adjust until 90° */
-#define TURN_SETTLE_OVFS     3     /* ~98 ms brake before re-engaging PID  */
-#define TURN_SPIN_PCT       60     /* PWM during the tank spin (0..100)   */
+/* Commit to spin when the front wall is this close. Replaces the old
+ * blind TURN_ENTRY_OVFS forward burst. */
+#define F_TURN_MM           230    /* larger = start SPIN earlier          */
+
+/* Safety net: if F never crosses F_TURN_MM (e.g. front sensor failure),
+ * spin anyway after this long in APPROACH. ~2.0 s @ 32.768 ms/ovf. */
+#define APPROACH_TIMEOUT_OVFS  60
+
+/* Open-loop tank spin. Calibrate TURN_SPIN_OVFS empirically:
+ *   23 ovfs ~= 0.75 s, 45 ovfs ~= 1.47 s. If 45 gave ~180 deg,
+ *   23 is the first-pass estimate for ~90 deg. */
+#define TURN_SPIN_PCT        60    /* PWM during spin (0..100)             */
+#define TURN_SPIN_OVFS       23    /* ~0.75 s — TUNE until 90° lands flat  */
+#define TURN_SETTLE_OVFS      4    /* ~131 ms brake before PID resumes     */
+
+/* Forward speed during APPROACH. Slightly slower than BASE so we don't
+ * overshoot F_TURN_MM between cycles. */
+#define APPROACH_SPEED_PCT   50
+
+/* One-sided PID gain in APPROACH. The opening side is unreliable, so we
+ * steer off the *other* wall only. Setpoint = half corridor width. */
+#define APPROACH_SETPOINT_MM 225   /* corridor is 450 mm, half = 225 mm    */
+#define APPROACH_KP_X100      20
 
 /* Sequence buffer. 32 turns is more than any reasonable course. */
-#define TURN_SEQ_MAX        32
+#define TURN_SEQ_MAX         32
 
 /* ---- TUNABLES: scheduling ---------------------------------------------- */
 
@@ -76,15 +96,16 @@
 #define PCT_TO_PWM(p)     ((int16_t)(((int32_t)(p) * 255) / 100))
 #define MAX_SPEED         PCT_TO_PWM(MAX_SPEED_PCT)
 #define BASE_SPEED        PCT_TO_PWM(BASE_SPEED_PCT)
+#define APPROACH_SPEED    PCT_TO_PWM(APPROACH_SPEED_PCT)
 #define TURN_SPIN_PWM     PCT_TO_PWM(TURN_SPIN_PCT)
 
 /* ---- STATE ------------------------------------------------------------ */
 
-typedef enum { ST_FOLLOW = 0, ST_TURN_ENTRY, ST_TURN_SPIN, ST_TURN_SETTLE } state_t;
+typedef enum { ST_CORRECTION = 0, ST_APPROACH, ST_SPIN, ST_SETTLE } state_t;
 
-static state_t state = ST_FOLLOW;
+static state_t state = ST_CORRECTION;
 static uint16_t state_start_ovf = 0;
-static char     pending_dir = 'L';      /* direction latched at FOLLOW exit */
+static char     pending_dir = 'L';      /* direction latched at CORRECTION exit */
 
 static uint8_t  open_count_L = 0;       /* consecutive "open" cycles, left  */
 static uint8_t  open_count_R = 0;       /* consecutive "open" cycles, right */
@@ -108,8 +129,12 @@ static inline int16_t clamp16(int32_t v, int16_t lim) {
     return (int16_t)v;
 }
 
-static inline uint8_t is_open(uint16_t mm) {
-    return (mm == US_NO_READING) || (mm > OPENING_MM);
+static inline uint8_t side_is_open(uint16_t mm) {
+    return (mm == US_NO_READING) || (mm >= SIDE_OPEN_MM);
+}
+
+static inline uint8_t front_is_close(uint16_t mm) {
+    return (mm != US_NO_READING) && (mm <= F_DETECT_MAX_MM);
 }
 
 static void enter_state(state_t s, uint16_t now_ovf) {
@@ -146,35 +171,46 @@ static void print_dist(const char *label, uint16_t mm) {
 
 static const char *state_tag(void) {
     switch (state) {
-        case ST_FOLLOW:       return "FOL";
-        case ST_TURN_ENTRY:   return "ENT";
-        case ST_TURN_SPIN:    return "SPN";
-        case ST_TURN_SETTLE:  return "SET";
+        case ST_CORRECTION:  return "COR";
+        case ST_APPROACH:    return "APP";
+        case ST_SPIN:        return "SPN";
+        case ST_SETTLE:      return "SET";
     }
     return "???";
 }
 
-/* ---- FOLLOW: PID + opening detection ---------------------------------- */
+/* ---- CORRECTION: PID + opening detection ------------------------------ */
 
-static void follow_step(uint16_t ovf) {
+static void correction_step(uint16_t ovf) {
     uint16_t L = us_distance_mm(US_LEFT);
     uint16_t R = us_distance_mm(US_RIGHT);
     uint16_t F = us_distance_mm(US_FRONT);
 
-    /* Opening detection (always evaluated, even before front-stop, so a
-     * dead-end corner that opens to one side still triggers a turn). */
-    if (is_open(L)) { if (open_count_L < 255) open_count_L++; } else open_count_L = 0;
-    if (is_open(R)) { if (open_count_R < 255) open_count_R++; } else open_count_R = 0;
+    /* Opening predicate: front close AND that side wide, sustained.
+     * Both conditions must hold on the SAME cycle to advance the count. */
+    uint8_t fclose = front_is_close(F);
+    if (fclose && side_is_open(L)) {
+        if (open_count_L < 255) open_count_L++;
+    } else {
+        open_count_L = 0;
+    }
+    if (fclose && side_is_open(R)) {
+        if (open_count_R < 255) open_count_R++;
+    } else {
+        open_count_R = 0;
+    }
 
     if (open_count_L >= OPENING_CONFIRM || open_count_R >= OPENING_CONFIRM) {
-        /* Left wins on a tie (left-hand rule, also gives consistent behavior). */
+        /* Left wins on a tie (left-hand rule). */
         pending_dir = (open_count_L >= OPENING_CONFIRM) ? 'L' : 'R';
         front_braking = 0;
-        enter_state(ST_TURN_ENTRY, ovf);
+        enter_state(ST_APPROACH, ovf);
         return;
     }
 
-    /* Front emergency stop (only if no opening pending). */
+    /* Front emergency stop — only honored in CORRECTION, never during a
+     * committed turn. Once a turn is latched, APPROACH/SPIN/SETTLE drive
+     * past the front-stop region on purpose. */
     if (F != US_NO_READING && F < FRONT_STOP_MM) {
         motors_stop();
         last_outL = last_outR = 0;
@@ -183,7 +219,8 @@ static void follow_step(uint16_t ovf) {
     }
     front_braking = 0;
 
-    /* If a side is missing but the other isn't open enough yet, crawl. */
+    /* If a side is missing but no opening has confirmed, crawl forward.
+     * Avoids latching a noisy NO_READING into an unwanted PID swing. */
     if (L == US_NO_READING || R == US_NO_READING) {
         int16_t crawl = BASE_SPEED / 2;
         motors_set(crawl, crawl);
@@ -224,51 +261,89 @@ static void follow_step(uint16_t ovf) {
     last_error = error;
 }
 
-/* ---- TURN: drive forward, spin, settle -------------------------------- */
+/* ---- APPROACH / SPIN / SETTLE ----------------------------------------- *
+ * Direction is locked. No opening checks, no front-stop, no transitions
+ * back to CORRECTION until SETTLE finishes. Ensures the turn cannot be
+ * preempted by transient sensor readings.
+ */
 
-static void turn_step(uint16_t ovf) {
-    uint16_t elapsed = ovf - state_start_ovf;
+static void approach_step(uint16_t ovf) {
+    uint16_t F = us_distance_mm(US_FRONT);
 
-    switch (state) {
-        case ST_TURN_ENTRY:
-            /* Straight forward at base speed (with trim). No PID — we
-             * don't trust side readings during corner traversal. */
-            {
-                int16_t trim = PCT_TO_PWM(MOTOR_TRIM_PCT);
-                int16_t l = clamp16((int32_t)BASE_SPEED + trim, MAX_SPEED);
-                int16_t r = clamp16((int32_t)BASE_SPEED - trim, MAX_SPEED);
-                if (l < 0) l = 0;
-                if (r < 0) r = 0;
-                motors_set(l, r);
-                last_outL = l;
-                last_outR = r;
-            }
-            if (elapsed >= TURN_ENTRY_OVFS) enter_state(ST_TURN_SPIN, ovf);
-            break;
+    /* Commit to spin once we are at the corner. */
+    if (F != US_NO_READING && F <= F_TURN_MM) {
+        enter_state(ST_SPIN, ovf);
+        return;
+    }
+    /* Safety: front sensor failure must not leave us creeping forever. */
+    if ((uint16_t)(ovf - state_start_ovf) >= APPROACH_TIMEOUT_OVFS) {
+        enter_state(ST_SPIN, ovf);
+        return;
+    }
 
-        case ST_TURN_SPIN:
-            /* Tank-spin: motors_set(-X, +X) is LEFT (CCW from above). */
-            if (pending_dir == 'L') {
-                motors_set(-TURN_SPIN_PWM, +TURN_SPIN_PWM);
-                last_outL = -TURN_SPIN_PWM; last_outR = +TURN_SPIN_PWM;
-            } else {
-                motors_set(+TURN_SPIN_PWM, -TURN_SPIN_PWM);
-                last_outL = +TURN_SPIN_PWM; last_outR = -TURN_SPIN_PWM;
-            }
-            if (elapsed >= TURN_SPIN_OVFS) enter_state(ST_TURN_SETTLE, ovf);
-            break;
+    /* One-sided P-only steering. The opening side is unreliable; use the
+     * wall that is NOT opening. error > 0 means too far from that wall,
+     * so steer toward it. */
+    uint16_t hold;
+    int16_t  err;
+    if (pending_dir == 'L') {
+        hold = us_distance_mm(US_RIGHT);
+        if (hold == US_NO_READING) {
+            err = 0;
+        } else {
+            err = (int16_t)APPROACH_SETPOINT_MM - (int16_t)hold;
+        }
+    } else {
+        hold = us_distance_mm(US_LEFT);
+        if (hold == US_NO_READING) {
+            err = 0;
+        } else {
+            err = (int16_t)hold - (int16_t)APPROACH_SETPOINT_MM;
+        }
+    }
 
-        case ST_TURN_SETTLE:
-            motors_stop();
-            last_outL = last_outR = 0;
-            if (elapsed >= TURN_SETTLE_OVFS) {
-                record_turn(pending_dir);
-                reset_pid();
-                enter_state(ST_FOLLOW, ovf);
-            }
-            break;
+    int32_t correct = ((int32_t)APPROACH_KP_X100 * err) / 100;
+    int16_t correct_pwm = clamp16(correct, APPROACH_SPEED);
 
-        default: break;
+    int16_t left  = (int16_t)((int32_t)APPROACH_SPEED + correct_pwm);
+    int16_t right = (int16_t)((int32_t)APPROACH_SPEED - correct_pwm);
+
+    int16_t trim_pwm = PCT_TO_PWM(MOTOR_TRIM_PCT);
+    left  += trim_pwm;
+    right -= trim_pwm;
+
+    if (left  < 0)         left  = 0;
+    if (right < 0)         right = 0;
+    if (left  > MAX_SPEED) left  = MAX_SPEED;
+    if (right > MAX_SPEED) right = MAX_SPEED;
+
+    motors_set(left, right);
+    last_outL  = left;
+    last_outR  = right;
+    last_error = err;
+}
+
+static void spin_step(uint16_t ovf) {
+    /* Pure open-loop. No sensor reads, no early aborts. */
+    if (pending_dir == 'L') {
+        motors_set(-TURN_SPIN_PWM, +TURN_SPIN_PWM);
+        last_outL = -TURN_SPIN_PWM; last_outR = +TURN_SPIN_PWM;
+    } else {
+        motors_set(+TURN_SPIN_PWM, -TURN_SPIN_PWM);
+        last_outL = +TURN_SPIN_PWM; last_outR = -TURN_SPIN_PWM;
+    }
+    if ((uint16_t)(ovf - state_start_ovf) >= TURN_SPIN_OVFS) {
+        enter_state(ST_SETTLE, ovf);
+    }
+}
+
+static void settle_step(uint16_t ovf) {
+    motors_stop();
+    last_outL = last_outR = 0;
+    if ((uint16_t)(ovf - state_start_ovf) >= TURN_SETTLE_OVFS) {
+        record_turn(pending_dir);
+        reset_pid();
+        enter_state(ST_CORRECTION, ovf);
     }
 }
 
@@ -283,16 +358,17 @@ void setup(void) {
     motors_init();
     sei();
 
-    uart_puts("\r\nWallBot: PID + 90 deg turn detect/execute\r\n");
+    uart_puts("\r\nWallBot: PID + sensor-gated 90 deg turn\r\n");
     uart_puts("MAX="); uart_put_u16(MAX_SPEED_PCT);
     uart_puts("%  BASE="); uart_put_u16(BASE_SPEED_PCT);
     uart_puts("%  TRIM="); uart_put_i16(MOTOR_TRIM_PCT);
     uart_puts("%  Kp*100="); uart_put_u16(KP_X100);
     uart_puts(" Kd*100=");   uart_put_u16(KD_X100);
     uart_puts(" Ki*100=");   uart_put_u16(KI_X100);
-    uart_puts("\r\nOPEN_MM="); uart_put_u16(OPENING_MM);
+    uart_puts("\r\nF_DET<="); uart_put_u16(F_DETECT_MAX_MM);
+    uart_puts(" SIDE>=");     uart_put_u16(SIDE_OPEN_MM);
     uart_puts(" CONFIRM=");   uart_put_u16(OPENING_CONFIRM);
-    uart_puts(" ENTRY=");     uart_put_u16(TURN_ENTRY_OVFS);
+    uart_puts(" F_TURN<=");   uart_put_u16(F_TURN_MM);
     uart_puts(" SPIN=");      uart_put_u16(TURN_SPIN_OVFS);
     uart_puts("@");           uart_put_u16(TURN_SPIN_PCT);
     uart_puts("%\r\n");
@@ -310,8 +386,12 @@ void loop(void) {
 
     if ((uint16_t)(ovf - last_pid_ovf) >= PID_PERIOD_OVFS) {
         last_pid_ovf = ovf;
-        if (state == ST_FOLLOW) follow_step(ovf);
-        else                    turn_step(ovf);
+        switch (state) {
+            case ST_CORRECTION: correction_step(ovf); break;
+            case ST_APPROACH:   approach_step(ovf);   break;
+            case ST_SPIN:       spin_step(ovf);       break;
+            case ST_SETTLE:     settle_step(ovf);     break;
+        }
     }
 
     if ((uint16_t)(ovf - last_print_ovf) >= PRINT_PERIOD_OVFS) {
