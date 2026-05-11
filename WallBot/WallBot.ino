@@ -45,7 +45,6 @@
 #define TURN_SPIN_OVFS       23
 #define TURN_SETTLE_OVFS     5
 #define TURN_SPEED_PCT       50
-#define TURN_HOLD_KP_X100    10
 #define TURN_SETPOINT_DEFAULT_MM  225
 #define POST_BOTH_WALLS_MM   400
 #define POST_TURN_TIMEOUT_OVFS 90
@@ -71,7 +70,6 @@ typedef enum {
     ST_CORRECTION = 0,
     ST_PRE_TURN,
     ST_SPIN,
-    ST_SETTLE,
     ST_POST_TURN
 } state_t;
 
@@ -173,7 +171,6 @@ static const char *state_name(state_t s) {
         case ST_CORRECTION: return "MOVING_FORWARD";
         case ST_PRE_TURN:   return "PRE_TURN";
         case ST_SPIN:       return "TURNING";
-        case ST_SETTLE:     return "SETTLING";
         case ST_POST_TURN:  return "POST_TURN";
     }
     return "???";
@@ -189,22 +186,39 @@ static inline uint16_t followed_wall_mm(void) {
 }
 
 static void wall_hold_drive(void) {
-    uint16_t hold = followed_wall_mm();
-    int16_t  err;
-    if (hold == US_NO_READING) {
-        err = 0;
-    } else if (pending_dir == 'L') {
-        err = (int16_t)turn_setpoint_mm - (int16_t)hold;
+    uint16_t L = us_distance_mm(US_LEFT);
+    uint16_t R = us_distance_mm(US_RIGHT);
+
+    /* Virtual-wall trick: the side that opened up gets replaced with the
+     * sampled setpoint distance, so the existing differential PID
+     * (KP/KD/KI tuned for CORRECTION) keeps working as if both walls
+     * were still present at the locked spacing. The no-reading branches
+     * are a safety net for the side that should still be visible. */
+    if (pending_dir == 'L') {
+        if (L == US_NO_READING || L >= SIDE_OPEN_MM) L = turn_setpoint_mm;
+        if (R == US_NO_READING)                      R = turn_setpoint_mm;
     } else {
-        err = (int16_t)hold - (int16_t)turn_setpoint_mm;
+        if (R == US_NO_READING || R >= SIDE_OPEN_MM) R = turn_setpoint_mm;
+        if (L == US_NO_READING)                      L = turn_setpoint_mm;
     }
 
-    int32_t correct     = ((int32_t)TURN_HOLD_KP_X100 * err) / 100;
-    int16_t correct_pwm = clamp16(correct, TURN_SPEED);
+    int16_t error = (int16_t)R - (int16_t)L;
+    int16_t deriv = error - prev_error;
+    integ += error;
+    if (integ >  INTEG_LIMIT) integ =  INTEG_LIMIT;
+    if (integ < -INTEG_LIMIT) integ = -INTEG_LIMIT;
 
-    int16_t left  = (int16_t)((int32_t)TURN_SPEED + correct_pwm);
-    int16_t right = (int16_t)((int32_t)TURN_SPEED - correct_pwm);
+    int32_t turn = ((int32_t)KP_X100 * error
+                  + (int32_t)KD_X100 * deriv
+                  + (int32_t)KI_X100 * integ) / 100;
 
+    int16_t turn_pwm = clamp16(turn, TURN_SPEED);
+    int16_t left  = (int16_t)((int32_t)TURN_SPEED + turn_pwm);
+    int16_t right = (int16_t)((int32_t)TURN_SPEED - turn_pwm);
+
+    /* Trim back on: hardware imbalance compensation was needed -- without
+     * it the bot's natural drift dominated single-wall holding and pulled
+     * us into openings. Re-comment if drift comes back. */
     int16_t trim_pwm = PCT_TO_PWM(MOTOR_TRIM_PCT);
     left  += trim_pwm;
     right -= trim_pwm;
@@ -215,9 +229,10 @@ static void wall_hold_drive(void) {
     if (right > MAX_SPEED) right = MAX_SPEED;
 
     motors_set(left, right);
+    prev_error = error;
     last_outL  = left;
     last_outR  = right;
-    last_error = err;
+    last_error = error;
 }
 
 static void sample_setpoint_if_pending(void) {
@@ -250,6 +265,7 @@ static void correction_step(uint16_t ovf) {
     if (open_count_L >= OPENING_CONFIRM || open_count_R >= OPENING_CONFIRM) {
         pending_dir   = (open_count_L >= OPENING_CONFIRM) ? 'L' : 'R';
         front_braking = 0;
+        reset_pid();  /* clean derivative state before virtual-wall PID */
         enter_state(ST_PRE_TURN, ovf);
         return;
     }
@@ -301,7 +317,7 @@ static void correction_step(uint16_t ovf) {
     last_error = error;
 }
 
-/* ---- PRE_TURN / SPIN / SETTLE / POST_TURN ----------------------------- */
+/* ---- PRE_TURN / SPIN / POST_TURN -------------------------------------- */
 
 static void pre_turn_step(uint16_t ovf) {
     sample_setpoint_if_pending();
@@ -329,14 +345,6 @@ static void spin_step(uint16_t ovf) {
         last_outL = +TURN_SPIN_PWM; last_outR = -TURN_SPIN_PWM;
     }
     if ((uint16_t)(ovf - state_start_ovf) >= TURN_SPIN_OVFS) {
-        enter_state(ST_SETTLE, ovf);
-    }
-}
-
-static void settle_step(uint16_t ovf) {
-    motors_stop();
-    last_outL = last_outR = 0;
-    if ((uint16_t)(ovf - state_start_ovf) >= TURN_SETTLE_OVFS) {
         record_turn(pending_dir);
         reset_pid();
         enter_state(ST_POST_TURN, ovf);
@@ -344,12 +352,24 @@ static void settle_step(uint16_t ovf) {
 }
 
 static void post_turn_step(uint16_t ovf) {
+    uint16_t since_entry = (uint16_t)(ovf - state_start_ovf);
+
+    /* Folded settle: bleed off spin inertia before wall-holding or
+     * sampling, so the first sensor read isn't taken mid-rotation. */
+    if (since_entry < TURN_SETTLE_OVFS) {
+        motors_stop();
+        last_outL = last_outR = 0;
+        return;
+    }
+
+    /* Sample the followed-wall distance exactly once, after the bleed. */
     sample_setpoint_if_pending();
 
     uint16_t L = us_distance_mm(US_LEFT);
     uint16_t R = us_distance_mm(US_RIGHT);
-    /* uint16_t F = us_distance_mm(US_FRONT); */  /* only used by Exit (b), disabled for test */
+    uint16_t F = us_distance_mm(US_FRONT);
 
+    /* Exit (a): both side walls visible -> hand back to PID centering. */
     if (L != US_NO_READING && R != US_NO_READING
         && L <= POST_BOTH_WALLS_MM && R <= POST_BOTH_WALLS_MM) {
         reset_pid();
@@ -357,19 +377,31 @@ static void post_turn_step(uint16_t ovf) {
         return;
     }
 
-    /* --- DISABLED FOR TEST ---
-     * Exit (b): another corner ahead. Hand off to CORRECTION; its
-     * opening-detection will pick up the next L/R immediately because
-     * F <= F_TURN_MM <= F_DETECT_MAX_MM and one side is still wide.
-     *
-     * if (F != US_NO_READING && F <= F_TURN_MM) {
-     *     reset_pid();
-     *     enter_state(ST_CORRECTION, ovf);
-     *     return;
-     * }
-     */
+    /* Exit (b): another corner already at our nose -> re-spin directly,
+     * skipping PRE_TURN. Direction comes from whichever side is open.
+     * If the read is ambiguous (both/neither open) fall back to
+     * CORRECTION so its debounced detector can resolve it safely. */
+    if (F != US_NO_READING && F <= F_TURN_MM) {
+        uint8_t lo = side_is_open(L);
+        uint8_t ro = side_is_open(R);
+        if (lo && !ro) {
+            pending_dir = 'L';
+            reset_pid();
+            enter_state(ST_SPIN, ovf);
+            return;
+        }
+        if (ro && !lo) {
+            pending_dir = 'R';
+            reset_pid();
+            enter_state(ST_SPIN, ovf);
+            return;
+        }
+        reset_pid();
+        enter_state(ST_CORRECTION, ovf);
+        return;
+    }
 
-    if ((uint16_t)(ovf - state_start_ovf) >= POST_TURN_TIMEOUT_OVFS) {
+    if (since_entry >= POST_TURN_TIMEOUT_OVFS) {
         reset_pid();
         enter_state(ST_CORRECTION, ovf);
         return;
@@ -403,8 +435,7 @@ void setup(void) {
     UART_sendString(" F_TURN<=");  UART_sendInt(F_TURN_MM);
     UART_sendString(" SPIN=");     UART_sendInt(TURN_SPIN_OVFS);
     UART_sendString("@");          UART_sendInt(TURN_SPIN_PCT);
-    UART_sendString("%  HOLD_KP*100="); UART_sendInt(TURN_HOLD_KP_X100);
-    UART_sendString(" POST_BOTH<=");    UART_sendInt(POST_BOTH_WALLS_MM);
+    UART_sendString("%  POST_BOTH<=");  UART_sendInt(POST_BOTH_WALLS_MM);
     UART_sendString("\r\n");
 
     /* ---- Press-to-start ---- */
@@ -435,7 +466,6 @@ void loop(void) {
             case ST_CORRECTION: correction_step(ovf); break;
             case ST_PRE_TURN:   pre_turn_step(ovf);   break;
             case ST_SPIN:       spin_step(ovf);        break;
-            case ST_SETTLE:     settle_step(ovf);      break;
             case ST_POST_TURN:  post_turn_step(ovf);   break;
         }
 
