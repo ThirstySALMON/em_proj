@@ -16,11 +16,11 @@
 // ---- TUNABLES: motion ----------------------------- 
 
 #define MAX_SPEED_PCT     100
-#define BASE_SPEED_PCT     75
-#define MOTOR_TRIM_PCT      6 // bcz of motor imbalance
+#define BASE_SPEED_PCT     67
+#define MOTOR_TRIM_PCT      -3 // bcz of motor imbalance (left += trim, right -= trim -> slows the faster right wheel)
 
 // pid constants
-#define KP_X100            18
+#define KP_X100            14
 #define KD_X100            68
 #define KI_X100             0
 #define INTEG_LIMIT      4000 // prevent integral from growing infinitely
@@ -30,20 +30,22 @@
 // ---- TUNABLES: turn detection ---------------------
  // (during pre turn)
 // Opening requires BOTH conditions
-#define F_DETECT_MAX_MM     475    // front must be <=  (corner ahead) 
+#define F_DETECT_MAX_MM     345    // front must be <=  (corner ahead) 
 #define SIDE_OPEN_MM        380    // a side counts as open at >= this     
 
-#define OPENING_CONFIRM       3    // consecutive cycles before committing   
-#define CORRECTION_ENTRY_COOLDOWN_OVFS 10  // after a turn - ignore openings for this many cycles as they might be faulty
+#define OPENING_CONFIRM       3    // consecutive cycles before committing
+#define CORRECTION_ENTRY_COOLDOWN_OVFS 10  // ignore openings for this many cycles after entering CORRECTION
+#define CORRECTION_SETTLE_OVFS         25  // use gentle gains + lower speed for this long after entering CORRECTION (covers ex-POST_TURN job)
+#define CORRECTION_DEADBAND_MM          8  // normal-correction deadband (smaller than wall-hold deadband)
 
 // ---- TUNABLES: turn execution ----------------------------------------- 
 
-#define F_TURN_MM           120 // when to turn
-#define PRE_TURN_FRONT_CONFIRM 3 // front wall must be close this many cycles before spin
+#define F_TURN_MM           250 // when to turn (raised so spin starts a bit further from the wall)
+#define PRE_TURN_FRONT_CONFIRM 2 // front wall must be close this many cycles before spin
 #define PRE_TURN_TIMEOUT_OVFS  90 // timeout for when to turn ()
-#define TURN_SPIN_PCT_L      45  // speed while spinning left
-#define TURN_SPIN_PCT_R      39  // speed while spinning right
-#define TURN_SPIN_OVFS       28 // timer for spinning
+#define TURN_SPIN_PCT_L      38  // speed while spinning left
+#define TURN_SPIN_PCT_R      33  // speed while spinning right
+#define TURN_SPIN_OVFS       20 // timer for spinning
 #define TURN_SETTLE_OVFS     5 // timer for settling after spin (cuz of inertia)
 #define TURN_SPEED_PCT       35 // speed in pre-turn (lowered so PID has time to correct gently)
 #define POST_TURN_SPEED_PCT  55 // speed in post turn (lowered so PID has time to correct gently)
@@ -345,9 +347,16 @@ static void correction_step(uint16_t ovf) {
     uint16_t R = us_distance_mm(US_RIGHT);
     uint16_t F = us_distance_mm(US_FRONT);
 
-    // ignore turn noise right after entering CORRECTION
-    uint8_t in_cooldown = ((uint16_t)(ovf - state_start_ovf)
-                           < CORRECTION_ENTRY_COOLDOWN_OVFS);
+    uint16_t since_entry = (uint16_t)(ovf - state_start_ovf);
+
+    // Two timing windows inside CORRECTION:
+    //   - "cooldown" (first 10 cycles): ignore opening detection entirely.
+    //   - "settle"  (first 25 cycles): use gentle gains + lower speed.
+    // After a SPIN, we land here directly (POST_TURN removed) -- the settle
+    // window stops the over-correction that used to happen as the new
+    // corridor's walls come into view one at a time.
+    uint8_t in_cooldown = (since_entry < CORRECTION_ENTRY_COOLDOWN_OVFS);
+    uint8_t in_settle   = (since_entry < CORRECTION_SETTLE_OVFS);
 
     if (in_cooldown) {
         open_count_L = open_count_R = 0;
@@ -356,32 +365,35 @@ static void correction_step(uint16_t ovf) {
         uint8_t l_open = side_is_open(L);
         uint8_t r_open = side_is_open(R);
 
-        // detect left opening
         if (fclose && l_open && !r_open) {
             if (open_count_L < 255) open_count_L++;
         } else {
             open_count_L = 0;
         }
-
-        // detect right opening
         if (fclose && r_open && !l_open) {
             if (open_count_R < 255) open_count_R++;
         } else {
             open_count_R = 0;
         }
 
-        // trigger turn if stable detection
-        if (open_count_L >= OPENING_CONFIRM || open_count_R >= OPENING_CONFIRM) {
+        // PRE_TURN bypassed: trigger SPIN directly when opening confirmed
+        // AND front wall is within F_TURN_MM. Also block this while in
+        // settle, so a half-emerged new corridor can't trigger a turn.
+        uint8_t opening_ready = (open_count_L >= OPENING_CONFIRM
+                                 || open_count_R >= OPENING_CONFIRM);
+        uint8_t front_at_spin = (F != US_NO_READING && F <= F_TURN_MM);
+        if (!in_settle && opening_ready && front_at_spin) {
             pending_dir   = (open_count_L >= OPENING_CONFIRM) ? 'L' : 'R';
             capture_pre_turn_setpoint(L, R);
+            capture_post_turn_setpoint(F);
             front_braking = 0;
             reset_pid();
-            enter_state(ST_PRE_TURN, ovf);
+            enter_state(ST_SPIN, ovf);
             return;
         }
     }
 
-    // stop if front is too close
+    // emergency front brake -- always active
     if (F != US_NO_READING && F < FRONT_STOP_MM) {
         motors_stop();
         last_outL = last_outR = 0;
@@ -390,62 +402,75 @@ static void correction_step(uint16_t ovf) {
     }
     front_braking = 0;
 
-    // crawl forward if both sensors are missing
+    // both sensors missing -> crawl forward (no steering basis)
     if (L == US_NO_READING && R == US_NO_READING) {
         int16_t crawl = BASE_SPEED / 2;
         motors_set(crawl, crawl);
-        last_outL  = last_outR = crawl;
+        last_outL = last_outR = crawl;
         last_error = 0;
         return;
     }
 
-    // replace open side with reference distance
+    // replace open / missing side with the corridor reference distance
     if (L == US_NO_READING || L >= SIDE_OPEN_MM) L = turn_setpoint_mm;
     if (R == US_NO_READING || R >= SIDE_OPEN_MM) R = turn_setpoint_mm;
 
-    // compute center error
     int16_t error = (int16_t)R - (int16_t)L;
 
-    // avoid derivative spike on first cycle
+    // Pick gains by window:
+    //   settle  -> gentle PD-only (same gains as wall-hold), low speed, tight clamp, no integral
+    //   normal  -> tuned KP/KD, full speed, /2 clamp (was full base), small deadband, integral
+    int16_t kp        = in_settle ? WALL_HOLD_KP_X100   : KP_X100;
+    int16_t kd        = in_settle ? WALL_HOLD_KD_X100   : KD_X100;
+    int16_t deadband  = in_settle ? WALL_HOLD_DEADBAND_MM : CORRECTION_DEADBAND_MM;
+    int16_t base      = in_settle ? POST_TURN_SPEED     : BASE_SPEED;
+    int16_t clamp_lim = in_settle ? (base / WALL_HOLD_TURN_FRAC) : (base / 2);
+    int16_t trim_pct  = in_settle ? WALL_HOLD_TRIM_PCT  : MOTOR_TRIM_PCT;
+
+    // deadband -- ignore small errors so sensor noise doesn't wiggle wheels
+    int16_t ctrl_error = error;
+    if      (ctrl_error >  deadband) ctrl_error -= deadband;
+    else if (ctrl_error < -deadband) ctrl_error += deadband;
+    else                             ctrl_error  = 0;
+
+    // first cycle after a reset_pid(): no derivative spike
     if (seed_prev_error) {
-        prev_error      = error;
+        prev_error      = ctrl_error;
         seed_prev_error = 0;
     }
+    int16_t deriv = ctrl_error - prev_error;
 
-    // derivative term
-    int16_t deriv = error - prev_error;
+    // integral only outside settle (settle uses pure PD to avoid wind-up
+    // from the inevitable one-sided readings just after a turn)
+    if (!in_settle) {
+        integ += ctrl_error;
+        if (integ >  INTEG_LIMIT) integ =  INTEG_LIMIT;
+        if (integ < -INTEG_LIMIT) integ = -INTEG_LIMIT;
+    } else {
+        integ = 0;
+    }
 
-    // integral term
-    integ += error;
-    if (integ >  INTEG_LIMIT) integ =  INTEG_LIMIT;
-    if (integ < -INTEG_LIMIT) integ = -INTEG_LIMIT;
-
-    // PID output
-    int32_t turn = ((int32_t)KP_X100 * error
-                  + (int32_t)KD_X100 * deriv
+    int32_t turn = ((int32_t)kp * ctrl_error
+                  + (int32_t)kd * deriv
                   + (int32_t)KI_X100 * integ) / 100;
 
-    // convert to motor speeds
-    int16_t turn_pwm = clamp16(turn, BASE_SPEED);
-    int16_t left  = (int16_t)((int32_t)BASE_SPEED + turn_pwm);
-    int16_t right = (int16_t)((int32_t)BASE_SPEED - turn_pwm);
+    int16_t turn_pwm = clamp16(turn, clamp_lim);
 
-    // motor imbalance correction
-    int16_t trim_pwm = PCT_TO_PWM(MOTOR_TRIM_PCT);
+    int16_t left  = (int16_t)((int32_t)base + turn_pwm);
+    int16_t right = (int16_t)((int32_t)base - turn_pwm);
+
+    int16_t trim_pwm = PCT_TO_PWM(trim_pct);
     left  += trim_pwm;
     right -= trim_pwm;
 
-    // clamp outputs
     if (left  < 0)         left  = 0;
     if (right < 0)         right = 0;
     if (left  > MAX_SPEED) left  = MAX_SPEED;
     if (right > MAX_SPEED) right = MAX_SPEED;
 
-    // send to motors
     motors_set(left, right);
 
-    // store state
-    prev_error = error;
+    prev_error = ctrl_error;
     last_outL  = left;
     last_outR  = right;
     last_error = error;
@@ -454,32 +479,31 @@ static void correction_step(uint16_t ovf) {
 // ---- PRE_TURN / SPIN / POST_TURN -------------------------------------- 
 
 static void pre_turn_step(uint16_t ovf) {
+    // TEST: PRE_TURN state is bypassed. CORRECTION jumps straight to SPIN
+    // once the opening is confirmed AND F <= F_TURN_MM. This body is left
+    // as a safety fallback in case the state is ever entered.
+    (void)ovf;
+    capture_post_turn_setpoint(us_distance_mm(US_FRONT));
+    enter_state(ST_SPIN, ovf);
 
-    // Turn only after the front wall is confirmed close for multiple cycles.
-    uint16_t F = us_distance_mm(US_FRONT);
-
-    // if front wall is close for enough cycles, start turning
-    if (F != US_NO_READING && F <= F_TURN_MM) {
-        if (pre_turn_front_count < 255) pre_turn_front_count++;
-
-        if (pre_turn_front_count >= PRE_TURN_FRONT_CONFIRM) {
-            capture_post_turn_setpoint(F);
-            enter_state(ST_SPIN, ovf);
-            return;
-        }
-    } else {
-        pre_turn_front_count = 0;
-    }
-
-    // fallback: if we waited too long, force turn anyway
-    if ((uint16_t)(ovf - state_start_ovf) >= PRE_TURN_TIMEOUT_OVFS) {
-        capture_post_turn_setpoint(F);
-        enter_state(ST_SPIN, ovf);
-        return;
-    }
-
-    // keep moving forward while holding wall alignment
-    wall_hold_drive(TURN_SPEED, turn_setpoint_mm);
+    // ---- ORIGINAL PRE_TURN LOGIC (commented out for test) ----
+    // uint16_t F = us_distance_mm(US_FRONT);
+    // if (F != US_NO_READING && F <= F_TURN_MM) {
+    //     if (pre_turn_front_count < 255) pre_turn_front_count++;
+    //     if (pre_turn_front_count >= PRE_TURN_FRONT_CONFIRM) {
+    //         capture_post_turn_setpoint(F);
+    //         enter_state(ST_SPIN, ovf);
+    //         return;
+    //     }
+    // } else {
+    //     pre_turn_front_count = 0;
+    // }
+    // if ((uint16_t)(ovf - state_start_ovf) >= PRE_TURN_TIMEOUT_OVFS) {
+    //     capture_post_turn_setpoint(F);
+    //     enter_state(ST_SPIN, ovf);
+    //     return;
+    // }
+    // wall_hold_drive(TURN_SPEED, turn_setpoint_mm);
 }
 
 static void spin_step(uint16_t ovf) {
@@ -504,9 +528,12 @@ static void spin_step(uint16_t ovf) {
         return;
     }
 
-    // phase 3: hand off to one-wall hold until both walls are visible again.
+    // phase 3: hand off to POST_TURN. POST_TURN holds the new side wall at
+    // the saved front distance until both corridor walls are visible, then
+    // CORRECTION takes over (with its own settle window for a soft handoff).
     record_turn(pending_dir);
     reset_pid();
+    turn_setpoint_mm = TURN_SETPOINT_DEFAULT_MM;  // sane fallback for missing-wall fill
     enter_state(ST_POST_TURN, ovf);
 }
 
@@ -514,6 +541,9 @@ static void post_turn_step(uint16_t ovf) {
     uint16_t L = us_distance_mm(US_LEFT);
     uint16_t R = us_distance_mm(US_RIGHT);
 
+    // Exit when both corridor walls have been visible for POST_EXIT_CONFIRM
+    // cycles. Then CORRECTION takes over (its settle window further softens
+    // the handoff before normal PID kicks in).
     uint8_t both_now = (L != US_NO_READING && R != US_NO_READING
                         && L <= POST_BOTH_WALLS_MM
                         && R <= POST_BOTH_WALLS_MM);
@@ -530,6 +560,16 @@ static void post_turn_step(uint16_t ovf) {
         return;
     }
 
+    // safety timeout: don't get stuck in POST_TURN forever
+    if ((uint16_t)(ovf - state_start_ovf) >= POST_TURN_TIMEOUT_OVFS) {
+        reset_pid();
+        enter_state(ST_CORRECTION, ovf);
+        return;
+    }
+
+    // Hold the new side wall at the front distance captured at spin time,
+    // using the gentle PD-only wall_hold (no derivative kicks, no integral
+    // wind-up, tight steering clamp).
     wall_hold_drive(POST_TURN_SPEED, post_turn_setpoint_mm);
 }
 
