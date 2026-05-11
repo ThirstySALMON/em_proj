@@ -270,38 +270,31 @@ static void capture_post_turn_setpoint(uint16_t F) {
     post_turn_setpoint_mm = (F == US_NO_READING) ? F_TURN_MM : F;
 }
 
-// Drive forward while holding ONE wall at target_mm. Used in PRE_TURN and POST_TURN.
-// Logic: pending_dir tells us which side is "opening" (and thus useless for control).
-//   - turning LEFT  -> follow the RIGHT wall  (L is faked = target so error = R - target)
-//   - turning RIGHT -> follow the LEFT  wall  (R is faked = target so error = target - L)
-// Uses GENTLE PD-only gains + deadband + tight clamp to prevent the over-correction
-// that was slamming the car into the wall before and after every turn.
+// forward while holding one wall at target_mm. Used in PRE_TURN and POST_TURN.
 static void wall_hold_drive(int16_t base, uint16_t target_mm) {
 
-    // read both side sensors (raw values)
+    // read both side sensors 
     uint16_t L = us_distance_mm(US_LEFT);
     uint16_t R = us_distance_mm(US_RIGHT);
 
-    // Fake the "opening" side so the PID only acts on the wall we're following.
+    // fake the opening side 
     if (pending_dir == 'L') {
-        L = target_mm;                          // we're following the right wall
-        if (R == US_NO_READING) R = target_mm;  // lost sensor -> drive straight
+        L = target_mm;                          
+        if (R == US_NO_READING) R = target_mm;  
     } else {
-        R = target_mm;                          // we're following the left wall
-        if (L == US_NO_READING) L = target_mm;  // lost sensor -> drive straight
+        R = target_mm;                          
+        if (L == US_NO_READING) L = target_mm;  
     }
 
-    // error = R - L. With one side faked = target, this is the signed deviation
-    // of the followed wall from the target distance.
     int16_t error = (int16_t)R - (int16_t)L;
 
-    // Deadband: small errors are sensor noise, not real drift. Don't react to them.
+    // ignore small errors are sensor noise
     int16_t ctrl_error = error;
     if (ctrl_error >  WALL_HOLD_DEADBAND_MM) ctrl_error -= WALL_HOLD_DEADBAND_MM;
     else if (ctrl_error < -WALL_HOLD_DEADBAND_MM) ctrl_error += WALL_HOLD_DEADBAND_MM;
     else ctrl_error = 0;
 
-    // First cycle after state change: kill the derivative spike.
+    // first cycle after state change kill the derivative spike.
     if (seed_prev_error) {
         prev_error      = ctrl_error;
         seed_prev_error = 0;
@@ -309,13 +302,10 @@ static void wall_hold_drive(int16_t base, uint16_t target_mm) {
 
     int16_t deriv = ctrl_error - prev_error;
 
-    // PD only -- no integral. Integral on a one-wall hold accumulates angular
-    // error from a slightly-off spin and creates a runaway correction.
     int32_t turn = ((int32_t)WALL_HOLD_KP_X100 * ctrl_error
                   + (int32_t)WALL_HOLD_KD_X100 * deriv) / 100;
 
-    // TIGHT clamp: never let one wheel get more than base/FRAC harder than the other.
-    // This is the single most important guard against slamming into the wall.
+    // clamping/ limiting pwm
     int16_t turn_lim = base / WALL_HOLD_TURN_FRAC;
     int16_t turn_pwm = clamp16(turn, turn_lim);
 
@@ -349,12 +339,7 @@ static void correction_step(uint16_t ovf) {
 
     uint16_t since_entry = (uint16_t)(ovf - state_start_ovf);
 
-    // Two timing windows inside CORRECTION:
-    //   - "cooldown" (first 10 cycles): ignore opening detection entirely.
-    //   - "settle"  (first 25 cycles): use gentle gains + lower speed.
-    // After a SPIN, we land here directly (POST_TURN removed) -- the settle
-    // window stops the over-correction that used to happen as the new
-    // corridor's walls come into view one at a time.
+  
     uint8_t in_cooldown = (since_entry < CORRECTION_ENTRY_COOLDOWN_OVFS);
     uint8_t in_settle   = (since_entry < CORRECTION_SETTLE_OVFS);
 
@@ -376,9 +361,7 @@ static void correction_step(uint16_t ovf) {
             open_count_R = 0;
         }
 
-        // PRE_TURN bypassed: trigger SPIN directly when opening confirmed
-        // AND front wall is within F_TURN_MM. Also block this while in
-        // settle, so a half-emerged new corridor can't trigger a turn.
+        // only when confirmed
         uint8_t opening_ready = (open_count_L >= OPENING_CONFIRM
                                  || open_count_R >= OPENING_CONFIRM);
         uint8_t front_at_spin = (F != US_NO_READING && F <= F_TURN_MM);
@@ -393,7 +376,7 @@ static void correction_step(uint16_t ovf) {
         }
     }
 
-    // emergency front brake -- always active
+    // emergency front brake 
     if (F != US_NO_READING && F < FRONT_STOP_MM) {
         motors_stop();
         last_outL = last_outR = 0;
@@ -402,7 +385,7 @@ static void correction_step(uint16_t ovf) {
     }
     front_braking = 0;
 
-    // both sensors missing -> crawl forward (no steering basis)
+    // both sensors missing -> crawl forward 
     if (L == US_NO_READING && R == US_NO_READING) {
         int16_t crawl = BASE_SPEED / 2;
         motors_set(crawl, crawl);
@@ -486,7 +469,7 @@ static void pre_turn_step(uint16_t ovf) {
     capture_post_turn_setpoint(us_distance_mm(US_FRONT));
     enter_state(ST_SPIN, ovf);
 
-    // ---- ORIGINAL PRE_TURN LOGIC (commented out for test) ----
+    // ---- og PRE_TURN LOGIC ----
     // uint16_t F = us_distance_mm(US_FRONT);
     // if (F != US_NO_READING && F <= F_TURN_MM) {
     //     if (pre_turn_front_count < 255) pre_turn_front_count++;
@@ -542,8 +525,7 @@ static void post_turn_step(uint16_t ovf) {
     uint16_t R = us_distance_mm(US_RIGHT);
 
     // Exit when both corridor walls have been visible for POST_EXIT_CONFIRM
-    // cycles. Then CORRECTION takes over (its settle window further softens
-    // the handoff before normal PID kicks in).
+    // cycles. Then CORRECTION takes over 
     uint8_t both_now = (L != US_NO_READING && R != US_NO_READING
                         && L <= POST_BOTH_WALLS_MM
                         && R <= POST_BOTH_WALLS_MM);
@@ -568,8 +550,7 @@ static void post_turn_step(uint16_t ovf) {
     }
 
     // Hold the new side wall at the front distance captured at spin time,
-    // using the gentle PD-only wall_hold (no derivative kicks, no integral
-    // wind-up, tight steering clamp).
+
     wall_hold_drive(POST_TURN_SPEED, post_turn_setpoint_mm);
 }
 
