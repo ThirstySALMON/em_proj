@@ -34,7 +34,7 @@
 /* Opening predicate requires BOTH conditions, sustained OPENING_CONFIRM
  * cycles. 1 overflow ~= 32.768 ms, so 3 cycles ~= 98 ms of debounce. */
 #define F_DETECT_MAX_MM     475    /* front must be <= this (corner ahead) */
-#define SIDE_OPEN_MM        350    /* a side counts as open at >= this     */
+#define SIDE_OPEN_MM        380    /* a side counts as open at >= this     */
 #define OPENING_CONFIRM       3    /* consecutive cycles before latching   */
 #define CORRECTION_ENTRY_COOLDOWN_OVFS 10  /* grace after entering CORRECTION */
 
@@ -42,8 +42,8 @@
 
 #define F_TURN_MM           120
 #define PRE_TURN_TIMEOUT_OVFS  60
-#define TURN_SPIN_PCT        40
-#define TURN_SPIN_OVFS       26
+#define TURN_SPIN_PCT        38
+#define TURN_SPIN_OVFS       23
 #define TURN_SETTLE_OVFS     5
 #define TURN_SPEED_PCT       50
 #define POST_TURN_SPEED_PCT  80   /* slight slowdown from MAX -- 25% stalled the motors */
@@ -335,13 +335,27 @@ static void correction_step(uint16_t ovf) {
     }
     front_braking = 0;
 
-    if (L == US_NO_READING || R == US_NO_READING) {
+    /* Safety crawl only when BOTH side sensors are dead. Previously this
+     * crawled on EITHER no-reading, which was overly defensive once we
+     * started substituting open sides below. */
+    if (L == US_NO_READING && R == US_NO_READING) {
         int16_t crawl = BASE_SPEED / 2;
         motors_set(crawl, crawl);
         last_outL  = last_outR = crawl;
         last_error = 0;
         return;
     }
+
+    /* Virtual-wall substitution: when one side is "open" (no-reading OR
+     * >= SIDE_OPEN_MM), pin it to turn_setpoint_mm so the open axis
+     * contributes no error. Differential PID then effectively does
+     * single-wall following at the locked corridor distance until the
+     * new wall comes into view. This is what makes SPIN -> CORRECTION
+     * (without POST_TURN) work: the asymmetric post-turn geometry stops
+     * being a PID problem because the open side is neutralized. Once
+     * both walls are valid, true centering resumes naturally. */
+    if (L == US_NO_READING || L >= SIDE_OPEN_MM) L = turn_setpoint_mm;
+    if (R == US_NO_READING || R >= SIDE_OPEN_MM) R = turn_setpoint_mm;
 
     int16_t error = (int16_t)R - (int16_t)L;
     if (seed_prev_error) {
@@ -398,18 +412,34 @@ static void pre_turn_step(uint16_t ovf) {
 }
 
 static void spin_step(uint16_t ovf) {
-    if (pending_dir == 'L') {
-        motors_set(-TURN_SPIN_PWM, +TURN_SPIN_PWM);
-        last_outL = -TURN_SPIN_PWM; last_outR = +TURN_SPIN_PWM;
-    } else {
-        motors_set(+TURN_SPIN_PWM, -TURN_SPIN_PWM);
-        last_outL = +TURN_SPIN_PWM; last_outR = -TURN_SPIN_PWM;
+    uint16_t elapsed = (uint16_t)(ovf - state_start_ovf);
+
+    /* Phase 1: active rotation. */
+    if (elapsed < TURN_SPIN_OVFS) {
+        if (pending_dir == 'L') {
+            motors_set(-TURN_SPIN_PWM, +TURN_SPIN_PWM);
+            last_outL = -TURN_SPIN_PWM; last_outR = +TURN_SPIN_PWM;
+        } else {
+            motors_set(+TURN_SPIN_PWM, -TURN_SPIN_PWM);
+            last_outL = +TURN_SPIN_PWM; last_outR = -TURN_SPIN_PWM;
+        }
+        return;
     }
-    if ((uint16_t)(ovf - state_start_ovf) >= TURN_SPIN_OVFS) {
-        record_turn(pending_dir);
-        reset_pid();
-        enter_state(ST_POST_TURN, ovf);
+
+    /* Phase 2: bleed inertia. Motors off so the bot stops rotating before
+     * CORRECTION starts driving. Sensors get a settled read on entry. */
+    if (elapsed < (uint16_t)(TURN_SPIN_OVFS + TURN_SETTLE_OVFS)) {
+        motors_stop();
+        last_outL = last_outR = 0;
+        return;
     }
+
+    /* Phase 3: hand off. POST_TURN is bypassed -- CORRECTION's
+     * per-cycle virtual-wall substitution handles the asymmetric
+     * post-turn geometry without a dedicated state. */
+    record_turn(pending_dir);
+    reset_pid();
+    enter_state(ST_CORRECTION, ovf);
 }
 
 static void post_turn_step(uint16_t ovf) {
