@@ -40,7 +40,8 @@
 
 #define F_TURN_MM           120 // when to turn
 #define PRE_TURN_TIMEOUT_OVFS  90 // timeout for when to turn ()
-#define TURN_SPIN_PCT        38  // speed while spinning
+#define TURN_SPIN_PCT_L      38  // speed while spinning left
+#define TURN_SPIN_PCT_R      34  // speed while spinning right
 #define TURN_SPIN_OVFS       23 // timer for spinning
 #define TURN_SETTLE_OVFS     5 // timer for settling after spin (cuz of inertia)
 #define TURN_SPEED_PCT       50 // speed in pre-turn
@@ -72,6 +73,8 @@
 // both motors have been commanded stopped continuously. Then reverse at
 // about 70% of normal speed until a valid turn or forward path is found. 
 #define RECOVERY_STOPPED_CONFIRM_OVFS 76  // ~2.49 s
+#define RECOVERY_IMPACT_FRONT_MM      30  // 2-3 cm: car is about to hit
+#define RECOVERY_IMPACT_CONFIRM_OVFS   2  // short debounce for ultrasonic noise
 #define RECOVERY_REVERSE_SPEED_PCT    55  // ~70% of BASE_SPEED_PCT
 #define RECOVERY_MIN_REVERSE_OVFS      8  // ~262 ms before exit checks
 #define RECOVERY_MAX_REVERSE_OVFS    120  // ~3.93 s safety fallback
@@ -86,7 +89,8 @@
 #define BASE_SPEED        PCT_TO_PWM(BASE_SPEED_PCT)
 #define TURN_SPEED        PCT_TO_PWM(TURN_SPEED_PCT)
 #define POST_TURN_SPEED   PCT_TO_PWM(POST_TURN_SPEED_PCT)
-#define TURN_SPIN_PWM     PCT_TO_PWM(TURN_SPIN_PCT)
+#define TURN_SPIN_PWM_L   PCT_TO_PWM(TURN_SPIN_PCT_L)
+#define TURN_SPIN_PWM_R   PCT_TO_PWM(TURN_SPIN_PCT_R)
 #define RECOVERY_REVERSE_SPEED PCT_TO_PWM(RECOVERY_REVERSE_SPEED_PCT)
 
 // ---- STATE ------------------------------------------------------------ 
@@ -128,6 +132,7 @@ static uint8_t  sample_setpoint  = 0;
 static uint8_t  completion_report_sent = 0;
 
 static uint8_t  recovery_stopped_count = 0;
+static uint8_t  recovery_impact_count = 0;
 static uint8_t  recovery_clear_count = 0;
 static uint8_t  recovery_corner_L_count = 0;
 static uint8_t  recovery_corner_R_count = 0;
@@ -480,11 +485,11 @@ static void spin_step(uint16_t ovf) {
     // phase 1: active rotation. 
     if (elapsed < TURN_SPIN_OVFS) {
         if (pending_dir == 'L') {
-            motors_set(-TURN_SPIN_PWM, +TURN_SPIN_PWM);
-            last_outL = -TURN_SPIN_PWM; last_outR = +TURN_SPIN_PWM;
+            motors_set(-TURN_SPIN_PWM_L, +TURN_SPIN_PWM_L);
+            last_outL = -TURN_SPIN_PWM_L; last_outR = +TURN_SPIN_PWM_L;
         } else {
-            motors_set(+TURN_SPIN_PWM, -TURN_SPIN_PWM);
-            last_outL = +TURN_SPIN_PWM; last_outR = -TURN_SPIN_PWM;
+            motors_set(+TURN_SPIN_PWM_R, -TURN_SPIN_PWM_R);
+            last_outL = +TURN_SPIN_PWM_R; last_outR = -TURN_SPIN_PWM_R;
         }
         return;
     }
@@ -602,9 +607,19 @@ static void recovery_reset_exit_counts(void) {
     recovery_corner_R_count = 0;
 }
 
+static void enter_reverse_recovery(uint16_t ovf) {
+    recovery_stopped_count = 0;
+    recovery_impact_count = 0;
+    recovery_reset_exit_counts();
+    front_braking = 0;
+    reset_pid();
+    enter_state(ST_REVERSE_RECOVERY, ovf);
+}
+
 static void recovery_monitor_update(uint16_t ovf) {
     if (!recovery_trigger_allowed(state)) {
         recovery_stopped_count = 0;
+        recovery_impact_count = 0;
         return;
     }
 
@@ -612,9 +627,17 @@ static void recovery_monitor_update(uint16_t ovf) {
         if ((uint16_t)(ovf - recovery_cooldown_start_ovf)
             < RECOVERY_COOLDOWN_OVFS) {
             recovery_stopped_count = 0;
+            recovery_impact_count = 0;
             return;
         }
         recovery_cooldown_active = 0;
+    }
+
+    uint16_t F = us_distance_mm(US_FRONT);
+    if (F != US_NO_READING && F <= RECOVERY_IMPACT_FRONT_MM) {
+        if (recovery_impact_count < 255) recovery_impact_count++;
+    } else {
+        recovery_impact_count = 0;
     }
 
     if (last_outL == 0 && last_outR == 0) {
@@ -623,12 +646,9 @@ static void recovery_monitor_update(uint16_t ovf) {
         recovery_stopped_count = 0;
     }
 
-    if (recovery_stopped_count >= RECOVERY_STOPPED_CONFIRM_OVFS) {
-        recovery_stopped_count = 0;
-        recovery_reset_exit_counts();
-        front_braking = 0;
-        reset_pid();
-        enter_state(ST_REVERSE_RECOVERY, ovf);
+    if (recovery_impact_count >= RECOVERY_IMPACT_CONFIRM_OVFS
+        || recovery_stopped_count >= RECOVERY_STOPPED_CONFIRM_OVFS) {
+        enter_reverse_recovery(ovf);
     }
 }
 
