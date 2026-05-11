@@ -39,19 +39,30 @@
 // ---- TUNABLES: turn execution ----------------------------------------- 
 
 #define F_TURN_MM           120 // when to turn
+#define PRE_TURN_FRONT_CONFIRM 3 // front wall must be close this many cycles before spin
 #define PRE_TURN_TIMEOUT_OVFS  90 // timeout for when to turn ()
 #define TURN_SPIN_PCT_L      45  // speed while spinning left
 #define TURN_SPIN_PCT_R      39  // speed while spinning right
 #define TURN_SPIN_OVFS       28 // timer for spinning
 #define TURN_SETTLE_OVFS     5 // timer for settling after spin (cuz of inertia)
-#define TURN_SPEED_PCT       50 // speed in pre-turn
-#define POST_TURN_SPEED_PCT  80   // speed in post turn
+#define TURN_SPEED_PCT       35 // speed in pre-turn (lowered so PID has time to correct gently)
+#define POST_TURN_SPEED_PCT  55 // speed in post turn (lowered so PID has time to correct gently)
 #define TURN_SETPOINT_DEFAULT_MM  225  // default one wall setpoint if we fail to sample (bcz of no-reading or simultaneous open)
 #define POST_BOTH_WALLS_MM   400 // distance to consider walls visible
-#define POST_TURN_TIMEOUT_OVFS 90 // timeout 
+#define POST_TURN_TIMEOUT_OVFS 90 // timeout
 #define POST_EXIT_CONFIRM      3  // consecutive cycles before POST_TURN exits
-#define WALL_HOLD_TRIM_PCT     3  // gentler trim during wall-hold 
-#define SIDE_VALID_MIN_MM      50 // min opposite-side mm to count exit (b) as a real corner 
+#define WALL_HOLD_TRIM_PCT     3  // gentler trim during wall-hold
+#define SIDE_VALID_MIN_MM      50 // min opposite-side mm to count exit (b) as a real corner
+
+// ---- TUNABLES: wall-hold PD (used in PRE_TURN and POST_TURN) ---------
+// Single-wall hold puts ALL sensor noise on one term, so KD on the normal
+// gains (68) caused huge derivative kicks -> one wheel pegged max, other
+// stopped, robot slammed into wall. Use much gentler PD-only control,
+// add a deadband, and tighten the steering clamp.
+#define WALL_HOLD_KP_X100      9   // half the normal KP
+#define WALL_HOLD_KD_X100      18  // ~1/4 the normal KD
+#define WALL_HOLD_DEADBAND_MM  20  // ignore errors smaller than this
+#define WALL_HOLD_TURN_FRAC    3   // turn_pwm clamped to base/FRAC
 
 // ---- TUNABLES: scheduling ---------------------------------------------- 
 
@@ -74,7 +85,7 @@
 // about 70% of normal speed until a valid turn or forward path is found. 
 #define RECOVERY_STOPPED_CONFIRM_OVFS 76  // ~2.49 s
 #define RECOVERY_IMPACT_FRONT_MM      30  // 2-3 cm: car is about to hit
-#define RECOVERY_IMPACT_CONFIRM_OVFS   2  // short debounce for ultrasonic noise
+#define RECOVERY_IMPACT_CONFIRM_OVFS   3  // short debounce for ultrasonic noise
 #define RECOVERY_REVERSE_SPEED_PCT    55  // ~70% of BASE_SPEED_PCT
 #define RECOVERY_MIN_REVERSE_OVFS      8  // ~262 ms before exit checks
 #define RECOVERY_MAX_REVERSE_OVFS    120  // ~3.93 s safety fallback
@@ -110,6 +121,7 @@ static char     pending_dir     = 'L';
 
 static uint8_t  open_count_L = 0;
 static uint8_t  open_count_R = 0;
+static uint8_t  pre_turn_front_count = 0;
 
 static uint8_t  post_both_count     = 0;
 static uint8_t  post_front_count    = 0;
@@ -128,7 +140,7 @@ static int16_t  last_error   = 0;
 static uint8_t  front_braking = 0;
 
 static uint16_t turn_setpoint_mm = TURN_SETPOINT_DEFAULT_MM;
-static uint8_t  sample_setpoint  = 0;
+static uint16_t post_turn_setpoint_mm = F_TURN_MM;
 static uint8_t  completion_report_sent = 0;
 
 static uint8_t  recovery_stopped_count = 0;
@@ -169,14 +181,8 @@ static void enter_state(state_t s, uint16_t now_ovf) {
     state = s;
     state_start_ovf = now_ovf; // when did we enter this state
 
-    // Sample the followed-wall distance ONLY at PRE_TURN entry. POST_TURN
-    // inherits the same setpoint so the bot recovers to the pre-turn
-    // corridor distance (taken while CORRECTION had us centered) instead
-    // of locking in whatever misaligned distance the spin happened to
-    // land on. Corridor width is fixed (45 cm) so the pre-turn target
-    // is still correct after a 90 deg turn. 
     if (s == ST_PRE_TURN) {
-        sample_setpoint = 1; // when entering PRE_TURN, sample the followed-wall distance
+        pre_turn_front_count = 0;
     }
     if (s == ST_POST_TURN) {
         // reset those to 0.. used to know which exit condition was hit.
@@ -252,62 +258,65 @@ static const char *state_tag(void) {
     return state_name(state);
 }
 
-// depending on which wall im following rn -> get its distance from ultrasonic
-static inline uint16_t followed_wall_mm(void) {
-    return (pending_dir == 'L') ? us_distance_mm(US_RIGHT)
-                                : us_distance_mm(US_LEFT);
+static void capture_pre_turn_setpoint(uint16_t L, uint16_t R) {
+    uint16_t hold = (pending_dir == 'L') ? R : L;
+    turn_setpoint_mm = (hold == US_NO_READING) ? TURN_SETPOINT_DEFAULT_MM
+                                                : hold;
 }
 
-// pid drive straight looping while holding the wall at a certain distance. Used in PRE_TURN and POST_TURN.
-static void wall_hold_drive(int16_t base) {
+static void capture_post_turn_setpoint(uint16_t F) {
+    post_turn_setpoint_mm = (F == US_NO_READING) ? F_TURN_MM : F;
+}
+
+// Drive forward while holding ONE wall at target_mm. Used in PRE_TURN and POST_TURN.
+// Logic: pending_dir tells us which side is "opening" (and thus useless for control).
+//   - turning LEFT  -> follow the RIGHT wall  (L is faked = target so error = R - target)
+//   - turning RIGHT -> follow the LEFT  wall  (R is faked = target so error = target - L)
+// Uses GENTLE PD-only gains + deadband + tight clamp to prevent the over-correction
+// that was slamming the car into the wall before and after every turn.
+static void wall_hold_drive(int16_t base, uint16_t target_mm) {
 
     // read both side sensors (raw values)
     uint16_t L = us_distance_mm(US_LEFT);
     uint16_t R = us_distance_mm(US_RIGHT);
 
-    // if we are preparing a LEFT turn, left side becomes "virtual"
-    // we replace it with the stored corridor distance so PID doesn't freak out
+    // Fake the "opening" side so the PID only acts on the wall we're following.
     if (pending_dir == 'L') {
-        L = turn_setpoint_mm;                                // fake left wall distance
-
-        // if right sensor is missing, also replace it so we don't get garbage values
-        if (R == US_NO_READING) R = turn_setpoint_mm;        // safety fallback
-    } 
-    else {
-        // same idea but mirrored for RIGHT turn
-        R = turn_setpoint_mm;                                // fake right wall distance
-
-        if (L == US_NO_READING) L = turn_setpoint_mm;        // safety fallback
+        L = target_mm;                          // we're following the right wall
+        if (R == US_NO_READING) R = target_mm;  // lost sensor -> drive straight
+    } else {
+        R = target_mm;                          // we're following the left wall
+        if (L == US_NO_READING) L = target_mm;  // lost sensor -> drive straight
     }
 
-    // compute how off-center we are (right minus left)
+    // error = R - L. With one side faked = target, this is the signed deviation
+    // of the followed wall from the target distance.
     int16_t error = (int16_t)R - (int16_t)L;
 
-    // first cycle after state change: prevent derivative spike
+    // Deadband: small errors are sensor noise, not real drift. Don't react to them.
+    int16_t ctrl_error = error;
+    if (ctrl_error >  WALL_HOLD_DEADBAND_MM) ctrl_error -= WALL_HOLD_DEADBAND_MM;
+    else if (ctrl_error < -WALL_HOLD_DEADBAND_MM) ctrl_error += WALL_HOLD_DEADBAND_MM;
+    else ctrl_error = 0;
+
+    // First cycle after state change: kill the derivative spike.
     if (seed_prev_error) {
-        prev_error      = error;   // lock previous error to current
-        seed_prev_error = 0;       // only do this once
+        prev_error      = ctrl_error;
+        seed_prev_error = 0;
     }
 
-    // how fast the error is changing
-    int16_t deriv = error - prev_error;
+    int16_t deriv = ctrl_error - prev_error;
 
-    // accumulate long-term drift
-    integ += error;
+    // PD only -- no integral. Integral on a one-wall hold accumulates angular
+    // error from a slightly-off spin and creates a runaway correction.
+    int32_t turn = ((int32_t)WALL_HOLD_KP_X100 * ctrl_error
+                  + (int32_t)WALL_HOLD_KD_X100 * deriv) / 100;
 
-    // clamp integral so it doesn't run away
-    if (integ >  INTEG_LIMIT) integ =  INTEG_LIMIT;
-    if (integ < -INTEG_LIMIT) integ = -INTEG_LIMIT;
+    // TIGHT clamp: never let one wheel get more than base/FRAC harder than the other.
+    // This is the single most important guard against slamming into the wall.
+    int16_t turn_lim = base / WALL_HOLD_TURN_FRAC;
+    int16_t turn_pwm = clamp16(turn, turn_lim);
 
-    // PID output (scaled down by /100 because gains are *100)
-    int32_t turn = ((int32_t)KP_X100 * error
-                  + (int32_t)KD_X100 * deriv
-                  + (int32_t)KI_X100 * integ) / 100;
-
-    // limit how strong correction can be (based on base speed)
-    int16_t turn_pwm = clamp16(turn, base);
-
-    // apply correction to motors
     int16_t left  = (int16_t)((int32_t)base + turn_pwm);
     int16_t right = (int16_t)((int32_t)base - turn_pwm);
 
@@ -316,29 +325,17 @@ static void wall_hold_drive(int16_t base) {
     left  += trim_pwm;
     right -= trim_pwm;
 
-    // make sure values stay in valid PWM range
     if (left  < 0)         left  = 0;
     if (right < 0)         right = 0;
     if (left  > MAX_SPEED) left  = MAX_SPEED;
     if (right > MAX_SPEED) right = MAX_SPEED;
 
-    // send final motor commands
     motors_set(left, right);
 
-    // save for next loop iteration
-    prev_error = error;
+    prev_error = ctrl_error;
     last_outL  = left;
     last_outR  = right;
     last_error = error;
-}
-
-// When entering PRE_TURN, sample the distance to the followed wall
-static void sample_setpoint_if_pending(void) {
-    if (!sample_setpoint) return;
-    uint16_t hold    = followed_wall_mm();
-    turn_setpoint_mm = (hold == US_NO_READING) ? TURN_SETPOINT_DEFAULT_MM
-                                                : hold;
-    sample_setpoint  = 0;
 }
 
 // ---- CORRECTION: PID + opening detection ------------------------------ 
@@ -376,6 +373,7 @@ static void correction_step(uint16_t ovf) {
         // trigger turn if stable detection
         if (open_count_L >= OPENING_CONFIRM || open_count_R >= OPENING_CONFIRM) {
             pending_dir   = (open_count_L >= OPENING_CONFIRM) ? 'L' : 'R';
+            capture_pre_turn_setpoint(L, R);
             front_braking = 0;
             reset_pid();
             enter_state(ST_PRE_TURN, ovf);
@@ -457,26 +455,31 @@ static void correction_step(uint16_t ovf) {
 
 static void pre_turn_step(uint16_t ovf) {
 
-    // capture corridor reference if it hasn’t been done yet
-    sample_setpoint_if_pending();
-
-    // read front distance
+    // Turn only after the front wall is confirmed close for multiple cycles.
     uint16_t F = us_distance_mm(US_FRONT);
 
-    // if front wall is close, start turning
+    // if front wall is close for enough cycles, start turning
     if (F != US_NO_READING && F <= F_TURN_MM) {
-        enter_state(ST_SPIN, ovf);
-        return;
+        if (pre_turn_front_count < 255) pre_turn_front_count++;
+
+        if (pre_turn_front_count >= PRE_TURN_FRONT_CONFIRM) {
+            capture_post_turn_setpoint(F);
+            enter_state(ST_SPIN, ovf);
+            return;
+        }
+    } else {
+        pre_turn_front_count = 0;
     }
 
     // fallback: if we waited too long, force turn anyway
     if ((uint16_t)(ovf - state_start_ovf) >= PRE_TURN_TIMEOUT_OVFS) {
+        capture_post_turn_setpoint(F);
         enter_state(ST_SPIN, ovf);
         return;
     }
 
     // keep moving forward while holding wall alignment
-    wall_hold_drive(TURN_SPEED);
+    wall_hold_drive(TURN_SPEED, turn_setpoint_mm);
 }
 
 static void spin_step(uint16_t ovf) {
@@ -501,12 +504,33 @@ static void spin_step(uint16_t ovf) {
         return;
     }
 
-    // phase 3: hand off. POST_TURN is bypassed -- CORRECTION's
-    // per-cycle virtual-wall substitution handles the asymmetric
-    // post-turn geometry without a dedicated state. 
+    // phase 3: hand off to one-wall hold until both walls are visible again.
     record_turn(pending_dir);
     reset_pid();
-    enter_state(ST_CORRECTION, ovf);
+    enter_state(ST_POST_TURN, ovf);
+}
+
+static void post_turn_step(uint16_t ovf) {
+    uint16_t L = us_distance_mm(US_LEFT);
+    uint16_t R = us_distance_mm(US_RIGHT);
+
+    uint8_t both_now = (L != US_NO_READING && R != US_NO_READING
+                        && L <= POST_BOTH_WALLS_MM
+                        && R <= POST_BOTH_WALLS_MM);
+
+    if (both_now) {
+        if (post_both_count < 255) post_both_count++;
+    } else {
+        post_both_count = 0;
+    }
+
+    if (post_both_count >= POST_EXIT_CONFIRM) {
+        reset_pid();
+        enter_state(ST_CORRECTION, ovf);
+        return;
+    }
+
+    wall_hold_drive(POST_TURN_SPEED, post_turn_setpoint_mm);
 }
 
 // DEPRECATED
@@ -805,7 +829,7 @@ void loop(void) {
             case ST_CORRECTION: correction_step(ovf); break;
             case ST_PRE_TURN:   pre_turn_step(ovf);   break;
             case ST_SPIN:       spin_step(ovf);        break;
-            // case ST_POST_TURN:  post_turn_step(ovf);   break; 
+            case ST_POST_TURN:  post_turn_step(ovf);   break;
             case ST_REVERSE_RECOVERY: reverse_recovery_step(ovf); break;
             case ST_COMPLETE:   complete_step();       break;
         }
