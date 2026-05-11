@@ -40,9 +40,9 @@
 
 #define F_TURN_MM           120 // when to turn
 #define PRE_TURN_TIMEOUT_OVFS  90 // timeout for when to turn ()
-#define TURN_SPIN_PCT_L      38  // speed while spinning left
-#define TURN_SPIN_PCT_R      34  // speed while spinning right
-#define TURN_SPIN_OVFS       23 // timer for spinning
+#define TURN_SPIN_PCT_L      45  // speed while spinning left
+#define TURN_SPIN_PCT_R      39  // speed while spinning right
+#define TURN_SPIN_OVFS       28 // timer for spinning
 #define TURN_SETTLE_OVFS     5 // timer for settling after spin (cuz of inertia)
 #define TURN_SPEED_PCT       50 // speed in pre-turn
 #define POST_TURN_SPEED_PCT  80   // speed in post turn
@@ -57,7 +57,7 @@
 
 #define PID_PERIOD_OVFS     1 // overflows between PID cycles.
 #define PRINT_PERIOD_OVFS   8
-#define PRINT_STATE_CHANGES  0
+#define PRINT_STATE_CHANGES  1
 #define PRINT_PERIODIC_STATUS 0
 
 // ---- TUNABLES: run completion detector -------------------------------- 
