@@ -41,9 +41,9 @@
 
 #define F_TURN_MM           120
 #define PRE_TURN_TIMEOUT_OVFS  60
-#define TURN_SPIN_PCT        43
-#define TURN_SPIN_OVFS       28
-#define TURN_SETTLE_OVFS     10
+#define TURN_SPIN_PCT        38
+#define TURN_SPIN_OVFS       23
+#define TURN_SETTLE_OVFS     5
 #define TURN_SPEED_PCT       50
 #define TURN_HOLD_KP_X100    10
 #define TURN_SETPOINT_DEFAULT_MM  225
@@ -54,6 +54,8 @@
 
 #define PID_PERIOD_OVFS     1
 #define PRINT_PERIOD_OVFS   8
+#define PRINT_STATE_CHANGES  1
+#define PRINT_PERIODIC_STATUS 0
 
 /* ---- DERIVED ---------------------------------------------------------- */
 
@@ -95,6 +97,8 @@ static uint8_t  sample_setpoint  = 0;
 
 /* ---- HELPERS ---------------------------------------------------------- */
 
+static const char *state_name(state_t s);
+
 static inline int16_t clamp16(int32_t v, int16_t lim) {
     if (v >  lim) return  lim;
     if (v < -lim) return -lim;
@@ -110,11 +114,21 @@ static inline uint8_t front_is_close(uint16_t mm) {
 }
 
 static void enter_state(state_t s, uint16_t now_ovf) {
+    state_t old_state = state;
     state = s;
     state_start_ovf = now_ovf;
     if (s == ST_PRE_TURN || s == ST_POST_TURN) {
         sample_setpoint = 1;
     }
+#if PRINT_STATE_CHANGES
+    if (old_state != s) {
+        UART_sendString("\r\nSTATE ");
+        UART_sendString(state_name(old_state));
+        UART_sendString(" -> ");
+        UART_sendString(state_name(s));
+        UART_sendString("\r\n");
+    }
+#endif
 }
 
 static void reset_pid(void) {
@@ -154,15 +168,19 @@ static void print_dist(const char *label, uint16_t mm) {
     UART_sendChar(' ');
 }
 
-static const char *state_tag(void) {
-    switch (state) {
-        case ST_CORRECTION: return "COR";
-        case ST_PRE_TURN:   return "PRE";
-        case ST_SPIN:       return "SPN";
-        case ST_SETTLE:     return "SET";
-        case ST_POST_TURN:  return "PST";
+static const char *state_name(state_t s) {
+    switch (s) {
+        case ST_CORRECTION: return "MOVING_FORWARD";
+        case ST_PRE_TURN:   return "PRE_TURN";
+        case ST_SPIN:       return "TURNING";
+        case ST_SETTLE:     return "SETTLING";
+        case ST_POST_TURN:  return "POST_TURN";
     }
     return "???";
+}
+
+static const char *state_tag(void) {
+    return state_name(state);
 }
 
 static inline uint16_t followed_wall_mm(void) {
@@ -402,8 +420,10 @@ void setup(void) {
 }
 
 void loop(void) {
-    static uint16_t last_print_ovf = 0;
     static uint16_t last_pid_ovf   = 0;
+#if PRINT_PERIODIC_STATUS
+    static uint16_t last_print_ovf = 0;
+#endif
 
     us_service();
 
@@ -431,6 +451,7 @@ void loop(void) {
          */
     }
 
+#if PRINT_PERIODIC_STATUS
     if ((uint16_t)(ovf - last_print_ovf) >= PRINT_PERIOD_OVFS) {
         last_print_ovf = ovf;
         UART_sendChar('['); UART_sendString(state_tag()); UART_sendString("] ");
@@ -445,4 +466,5 @@ void loop(void) {
         UART_sendString("\r\n");
         LED_PORT ^= (1 << LED_BIT);
     }
+#endif
 }

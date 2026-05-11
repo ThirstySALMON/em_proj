@@ -1,7 +1,7 @@
 /*
- * uart.h — minimal polled USART0 driver (TX + optional RX).
- * 8N1, blocking writes. Used for debug prints over USB-serial during
- * bring-up; the same pins drive the HC-05 in flight.
+ * uart.h - interrupt-driven USART0 driver (TX + RX), 8N1.
+ * Send functions enqueue bytes and return immediately. If the TX buffer
+ * fills, extra bytes are dropped instead of blocking the control loop.
  */
 #ifndef UART_H
 #define UART_H
