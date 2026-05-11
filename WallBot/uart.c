@@ -5,7 +5,7 @@
 
 
 #define UART_RX_BUFFER_SIZE 64
-#define UART_TX_BUFFER_SIZE 256
+#define UART_TX_BUFFER_SIZE 768
 
 static volatile char uart_rx_buffer[UART_RX_BUFFER_SIZE];
 static volatile uint8_t uart_rx_head = 0;
@@ -13,8 +13,8 @@ static volatile uint8_t uart_rx_tail = 0;
 static volatile uint8_t uart_rx_overflow = 0;
 
 static volatile char uart_tx_buffer[UART_TX_BUFFER_SIZE];
-static volatile uint8_t uart_tx_head = 0;
-static volatile uint8_t uart_tx_tail = 0;
+static volatile uint16_t uart_tx_head = 0;
+static volatile uint16_t uart_tx_tail = 0;
 static volatile uint8_t uart_tx_overflow = 0;
 
 void UART_init(unsigned long baud)
@@ -35,7 +35,7 @@ void UART_init(unsigned long baud)
 
 void UART_sendChar(char c)
 {
-  uint8_t next = (uint8_t)((uart_tx_head + 1) % UART_TX_BUFFER_SIZE);
+  uint16_t next = (uint16_t)((uart_tx_head + 1) % UART_TX_BUFFER_SIZE);
 
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
   {
@@ -163,6 +163,6 @@ ISR(USART_UDRE_vect)
   else
   {
     UDR0 = uart_tx_buffer[uart_tx_tail];
-    uart_tx_tail = (uint8_t)((uart_tx_tail + 1) % UART_TX_BUFFER_SIZE);
+    uart_tx_tail = (uint16_t)((uart_tx_tail + 1) % UART_TX_BUFFER_SIZE);
   }
 }

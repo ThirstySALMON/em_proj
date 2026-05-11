@@ -11,6 +11,7 @@
 #include "ultrasonic.h"
 #include "motors.h"
 #include "turn_tracker.h"
+#include "completion_detector.h"
 
 #ifndef F_CPU
 #define F_CPU 16000000UL
@@ -61,6 +62,15 @@
 #define PRINT_STATE_CHANGES  1
 #define PRINT_PERIODIC_STATUS 0
 
+/* ---- TUNABLES: run completion detector -------------------------------- */
+
+/* Completion is detected by a separate monitor, not by wall following:
+ * all three sensors open continuously for this many Timer1 overflows.
+ * 62 ovfs ~= 2.03 s because one overflow is about 32.768 ms. */
+#define COMPLETE_OPEN_MM          350
+#define COMPLETE_CONFIRM_OVFS      62
+#define COMPLETE_NO_READING_OPEN    1
+
 /* ---- DERIVED ---------------------------------------------------------- */
 
 #define PCT_TO_PWM(p)     ((int16_t)(((int32_t)(p) * 255) / 100))
@@ -76,7 +86,8 @@ typedef enum {
     ST_CORRECTION = 0,
     ST_PRE_TURN,
     ST_SPIN,
-    ST_POST_TURN
+    ST_POST_TURN,
+    ST_COMPLETE
 } state_t;
 
 static state_t  state           = ST_CORRECTION;
@@ -104,6 +115,14 @@ static uint8_t  front_braking = 0;
 
 static uint16_t turn_setpoint_mm = TURN_SETPOINT_DEFAULT_MM;
 static uint8_t  sample_setpoint  = 0;
+static uint8_t  completion_report_sent = 0;
+
+static completion_detector_t completion_detector;
+static const completion_detector_config_t completion_config = {
+    COMPLETE_OPEN_MM,
+    COMPLETE_CONFIRM_OVFS,
+    COMPLETE_NO_READING_OPEN
+};
 
 /* ---- HELPERS ---------------------------------------------------------- */
 
@@ -202,6 +221,7 @@ static const char *state_name(state_t s) {
         case ST_PRE_TURN:   return "PRE_TURN";
         case ST_SPIN:       return "TURNING";
         case ST_POST_TURN:  return "POST_TURN";
+        case ST_COMPLETE:   return "COMPLETE";
     }
     return "???";
 }
@@ -527,6 +547,20 @@ static void post_turn_step(uint16_t ovf) {
     wall_hold_drive(POST_TURN_SPEED);
 }
 
+/* ---- COMPLETE --------------------------------------------------------- */
+
+static void complete_step(void) {
+    motors_stop();
+    motors_enable(0);
+    last_outL = last_outR = 0;
+
+    if (!completion_report_sent) {
+        completion_report_sent = 1;
+        UART_sendString("\r\nRUN COMPLETE\r\n");
+        sendReport();
+    }
+}
+
 /* ---- ENTRY POINTS ----------------------------------------------------- */
 
 void setup(void) {
@@ -537,6 +571,7 @@ void setup(void) {
     us_init();
     motors_init();
     turns_init();
+    completion_detector_init(&completion_detector, &completion_config);
     sei();
 
     UART_sendString("\r\nWallBot: PID + sensor-gated 90 deg turn\r\n");
@@ -553,16 +588,18 @@ void setup(void) {
     UART_sendString(" SPIN=");     UART_sendInt(TURN_SPIN_OVFS);
     UART_sendString("@");          UART_sendInt(TURN_SPIN_PCT);
     UART_sendString("%  POST_BOTH<=");  UART_sendInt(POST_BOTH_WALLS_MM);
+    UART_sendString(" COMPLETE_OPEN>"); UART_sendInt(COMPLETE_OPEN_MM);
+    UART_sendString(" COMPLETE_OVFS="); UART_sendInt(COMPLETE_CONFIRM_OVFS);
     UART_sendString("\r\n");
 
-    /* ---- Press-to-start ---- */
-    // UART_sendString("Send 's' to start...\r\n");
-    // char ch;
-    // while (1) {
-    //     if (UART_receiveChar(&ch) && ch == 's') break;
-    // }
-    // UART_sendString("Starting!\r\n");
-    /* ------------------------ */
+    // /* ---- Press-to-start ---- */
+    //  UART_sendString("Send 's' to start...\r\n");
+    //  char ch;
+    //  while (1) {
+    //      if (UART_receiveChar(&ch) && ch == 's') break;
+    //  }
+    //  UART_sendString("Starting!\r\n");
+    // /* ------------------------ */
 
     motors_enable(1);
 }
@@ -579,23 +616,23 @@ void loop(void) {
 
     if ((uint16_t)(ovf - last_pid_ovf) >= PID_PERIOD_OVFS) {
         last_pid_ovf = ovf;
+
+        if (state != ST_COMPLETE
+            && completion_detector_update(&completion_detector,
+                                          us_distance_mm(US_FRONT),
+                                          us_distance_mm(US_LEFT),
+                                          us_distance_mm(US_RIGHT),
+                                          ovf)) {
+            enter_state(ST_COMPLETE, ovf);
+        }
+
         switch (state) {
             case ST_CORRECTION: correction_step(ovf); break;
             case ST_PRE_TURN:   pre_turn_step(ovf);   break;
             case ST_SPIN:       spin_step(ovf);        break;
             case ST_POST_TURN:  post_turn_step(ovf);   break;
+            case ST_COMPLETE:   complete_step();       break;
         }
-
-        /* TODO: add end-of-track detection condition here.
-         * When the track is finished, call sendReport() to transmit
-         * the full turn summary over Bluetooth/UART, then stop motors.
-         *
-         * if (end_of_track_detected()) {
-         *     motors_stop();
-         *     sendReport();
-         *     while (1);
-         * }
-         */
     }
 
 #if PRINT_PERIODIC_STATUS
