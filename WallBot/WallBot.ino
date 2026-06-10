@@ -57,10 +57,7 @@
 #define SIDE_VALID_MIN_MM      50 // min opposite-side mm to count exit (b) as a real corner
 
 // ---- TUNABLES: wall-hold PD (used in PRE_TURN and POST_TURN) ---------
-// Single-wall hold puts ALL sensor noise on one term, so KD on the normal
-// gains (68) caused huge derivative kicks -> one wheel pegged max, other
-// stopped, robot slammed into wall. Use much gentler PD-only control,
-// add a deadband, and tighten the steering clamp.
+
 #define WALL_HOLD_KP_X100      9   // half the normal KP
 #define WALL_HOLD_KD_X100      18  // ~1/4 the normal KD
 #define WALL_HOLD_DEADBAND_MM  20  // ignore errors smaller than this
@@ -82,15 +79,13 @@
 
 // ---- TUNABLES: reverse recovery --------------------------------------- 
 
-// Collision recovery is independent from navigation. Trigger only after
-// both motors have been commanded stopped continuously. Then reverse at
-// about 70% of normal speed until a valid turn or forward path is found. 
-#define RECOVERY_STOPPED_CONFIRM_OVFS 76  // ~2.49 s
-#define RECOVERY_IMPACT_FRONT_MM      30  // 2-3 cm: car is about to hit
-#define RECOVERY_IMPACT_CONFIRM_OVFS   3  // short debounce for ultrasonic noise
-#define RECOVERY_REVERSE_SPEED_PCT    55  // ~70% of BASE_SPEED_PCT
-#define RECOVERY_MIN_REVERSE_OVFS      8  // ~262 ms before exit checks
-#define RECOVERY_MAX_REVERSE_OVFS    120  // ~3.93 s safety fallback
+
+#define RECOVERY_STOPPED_CONFIRM_OVFS 76  
+#define RECOVERY_IMPACT_FRONT_MM      30   
+#define RECOVERY_IMPACT_CONFIRM_OVFS   3  
+#define RECOVERY_REVERSE_SPEED_PCT    55  
+#define RECOVERY_MIN_REVERSE_OVFS      8  
+#define RECOVERY_MAX_REVERSE_OVFS    120  
 #define RECOVERY_EXIT_CONFIRM_OVFS     3
 #define RECOVERY_FRONT_CLEAR_MM      160
 #define RECOVERY_COOLDOWN_OVFS       15
@@ -461,10 +456,11 @@ static void correction_step(uint16_t ovf) {
 
 // ---- PRE_TURN / SPIN / POST_TURN -------------------------------------- 
 
+// DEPRECATED
 static void pre_turn_step(uint16_t ovf) {
-    // TEST: PRE_TURN state is bypassed. CORRECTION jumps straight to SPIN
+    // PRE_TURN state is bypassed. CORRECTION jumps straight to SPIN
     // once the opening is confirmed AND F <= F_TURN_MM. This body is left
-    // as a safety fallback in case the state is ever entered.
+
     (void)ovf;
     capture_post_turn_setpoint(us_distance_mm(US_FRONT));
     enter_state(ST_SPIN, ovf);
