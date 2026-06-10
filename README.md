@@ -3,9 +3,7 @@
 # Wall-Following Autonomous Robot
 
 <br />
-<div align="center">
-  <h3 align="center">Wall-Following Autonomous Robot</h3>
-</div>
+
 
 <!-- TABLE OF CONTENTS -->
 <details>
